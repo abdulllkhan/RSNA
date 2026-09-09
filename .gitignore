@@ -1,0 +1,35 @@
+# secrets
+.env
+*.key
+kaggle.json
+# heavy / generated
+data/
+models/
+checkpoints/
+*.zip
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+wandb/
+*.slim.pt
+*.pkl
+*.parquet
+*.csv
+
+# generated notebook artefacts (rebuild with notebook/build_notebook*.py)
+notebook/submission*.ipynb
+notebook/submission_standalone.py
+notebook/submission_multi_standalone.py
+
+# scratch / staging
+dev/kaggle/weights_pkg/
+logs/
+*.log
+outputs/
+oof/

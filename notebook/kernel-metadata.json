@@ -1,0 +1,17 @@
+{
+  "id": "abdullllkhan/rsna-knee-baseline-infer",
+  "title": "RSNA Knee Baseline Infer",
+  "code_file": "submission.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "dataset_sources": [
+    "abdullllkhan/rsna-knee-weights-v1"
+  ],
+  "kernel_sources": []
+}

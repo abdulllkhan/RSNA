@@ -1,0 +1,1 @@
+.venv/bin/python -m src.rsna.train_25d --fold 0 --size 384 --k 24 --batch 6 --grad-accum 3 --workers 6 --epochs 10 --lr 3e-4 --cache-root data/cache384 --order-parquet data/series_order.parquet --dicom-root data/raw --name effv2s_k24_384_25d --max-train-minutes 170
