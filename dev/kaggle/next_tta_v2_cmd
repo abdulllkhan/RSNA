@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 nice -n 19 ionice -c3 .venv/bin/python dev/tta_eval_v2.py --name v2_effv2s384_lr --cache-root data/cache_c140_384 --folds 0,1,2,3,4 --variants 3 --device cuda --batch 2 --workers 4 --check-combiner

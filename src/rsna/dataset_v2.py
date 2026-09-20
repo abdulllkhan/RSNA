@@ -43,6 +43,13 @@ WHAT IS NEW
 * per-cell label weights (`data/labels/consensus_v1.parquet`), with a 1.0-weight stub built
   from `llm_labels_v4_blend.csv` until that file exists.
 
+SLOT-PHASE TTA (`reports/tta_v2.md`). `plan_slots(..., phase=p)` shifts the whole eval position
+grid by `p` slot spacings (`variant_phases(S)` = the v0/v1/... ladder, mirroring `tta.py`:
+0, +1/3, -1/3, ...). `phase=0.0` is short-circuited and reproduces today's positions bit for
+bit, so S=1 is the literal pre-TTA path. Only `SlotPick.idx` moves — the series choice, `pos`,
+the flip and `valid` do not — which is why `infer_v2` can build all S variant bags from ONE
+decode per study.
+
 THE PLANNER IS SHARED WITH INFERENCE. `select_slot_series` + `plan_slots` are pure functions
 over `(plane, fluid, n_slices)` records; `infer_v2.py` calls the SAME two functions on the
 DICOM mount, so the slot choice, the positions and the canonicalisation cannot drift between
@@ -399,12 +406,33 @@ def select_slot_series(
 
 
 def _slot_fracs(n_want: int, train: bool, rng: Optional[np.random.Generator],
-                jitter: float) -> List[float]:
+                jitter: float, phase: float = 0.0) -> List[float]:
     """`n_want` evenly-spaced fractions over the span [0.02, 0.98], jittered on train.
 
     `jitter=1.0` moves each position by up to +/- HALF the slot spacing — the same
     convention as `dataset._pick_positions` (`frac += (rng.random()-0.5)*jitter/n`), mapped
     onto the span instead of the whole [0,1) range.
+
+    `phase` is the TTA knob (`variant_phases`): a DETERMINISTIC shift of the whole grid, in
+    units of ONE slot spacing `step = span / n_want`, exactly as `tta.pick_positions_variant`
+    shifts the other arms' midpoint grid by `phase / n`:
+
+        frac_j = SPAN_LO + span * (j + 0.5) / n_want  +  phase * step        (then clamped)
+
+    `phase = 0.0` is SHORT-CIRCUITED — the line below is skipped entirely, so the identity
+    variant runs the literal pre-TTA expression and reproduces today's fractions bit for bit
+    (`tta.py` uses the same "identity patches nothing" discipline). The rng is drawn in the
+    same order for every phase, so a train-mode plan is unaffected by the default.
+
+    EDGES. The shifted fraction is clamped into the span [SPAN_LO, SPAN_HI] before
+    `plan_slots` turns it into `idx = floor(frac * n)` (itself clamped to `0..n-1`), so a
+    phase can never walk a position off the stack: at |phase| = 0.5 the outermost position
+    lands exactly ON the span boundary and any larger |phase| saturates there, collapsing the
+    outer positions onto the boundary slice instead of extrapolating past it. For a series
+    with FEWER slices than the slot wants, neighbouring positions already share an index, so
+    a +/-1/3 phase leaves some (occasionally all) of that slot's picks unchanged — a
+    degenerate-but-correct no-op, not an error; `dev/smoke_v2_tta.sh` reports the fraction of
+    slots a variant actually moves.
     """
     span = SPAN_HI - SPAN_LO
     step = span / max(1, n_want)
@@ -413,8 +441,62 @@ def _slot_fracs(n_want: int, train: bool, rng: Optional[np.random.Generator],
         f = SPAN_LO + span * (j + 0.5) / n_want
         if train and rng is not None and jitter:
             f += (rng.random() - 0.5) * float(jitter) * step
+        if phase:                                   # identity (phase=0) touches nothing
+            f = min(SPAN_HI, max(SPAN_LO, f + float(phase) * step))
         fracs.append(min(SPAN_HI, max(0.0, f)))
     return fracs
+
+
+# --------------------------------------------------------------------------------------
+# Slot-phase TTA variants (the v2 mirror of `tta.VARIANT_LADDER`)
+# --------------------------------------------------------------------------------------
+#   v0  0     the baseline eval grid — `sampling_variants(S)[0].is_identity` in tta.py
+#   v1  +1/3  a third of a slot spacing deeper into the stack
+#   v2  -1/3  a third earlier
+#   v3  +1/2  the slot-BOUNDARY grid. `tta.py`'s v3 is `mode="span"` (an endpoint-inclusive
+#             grid over the whole series); v2's span is already fixed at [0.02, 0.98] by the
+#             arm's contract, so the closest pure-phase analogue — the largest shift that
+#             still lands inside the span — takes that rung instead.
+#   v4  +1/6 ;  v5  -1/6                         (same as tta.py)
+V2_PHASE_LADDER: Tuple[float, ...] = (0.0, +1.0 / 3.0, -1.0 / 3.0, +0.5, +1.0 / 6.0, -1.0 / 6.0)
+
+
+def variant_phases(n: int, seed: int = 42) -> List[float]:
+    """The first `n` slot-phase TTA variants; `[0]` is ALWAYS 0.0 (== today's eval sampling).
+
+    Mirrors `tta.sampling_variants(n)`: a fixed prefix ladder, so an S=2 run's variants are a
+    prefix of an S=3 run's and a cached v1 frame is reusable across S; `seed` only affects
+    variants beyond the ladder, drawn uniformly from (-0.5, +0.5) — the range within which a
+    phase still lands inside the span at every position (see `_slot_fracs`).
+    """
+    n = int(n)
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+    out = [float(p) for p in V2_PHASE_LADDER[:n]]
+    if n > len(V2_PHASE_LADDER):
+        rng = np.random.default_rng(seed)
+        out += [float(rng.uniform(-0.5, 0.5)) for _ in range(n - len(V2_PHASE_LADDER))]
+    assert out[0] == 0.0, "variant 0 must be the baseline eval sampling"
+    return out
+
+
+def variant_index_of(phase: float) -> int:
+    """Ladder index of `phase`, or -1 if it is not a ladder rung.
+
+    Lets a caller that recomputes only SOME variants (a resumed `dev/tta_eval_v2.py` sweep)
+    still log and name them by their ladder index rather than by their position in that
+    partial list.
+    """
+    for i, p in enumerate(V2_PHASE_LADDER):
+        if abs(float(phase) - float(p)) < 1e-12:
+            return i
+    return -1
+
+
+def variant_label(idx: int, phase: float) -> str:
+    """`v1[phase=+0.3333]` — the log label, shaped like `tta.SamplingVariant.label`."""
+    return (f"v{int(idx)}[phase={float(phase):+.4f}]"
+            + (" == baseline eval sampling" if float(phase) == 0.0 else ""))
 
 
 def plan_slots(
@@ -423,6 +505,7 @@ def plan_slots(
     train: bool = False,
     rng: Optional[np.random.Generator] = None,
     jitter: float = V2_JITTER,
+    phase: float = 0.0,
 ) -> List[SlotPick]:
     """Positions inside each chosen series + the laterality canonicalisation.
 
@@ -438,6 +521,11 @@ def plan_slots(
         means the same anatomical station regardless of side. `pos` is assigned AFTER the
         reversal, so the position embedding is canonical too.
     No flip is ever applied as an augmentation (see module docstring).
+
+    `phase` (eval-time TTA, `variant_phases`) shifts the whole position grid by that fraction
+    of one slot spacing; `phase=0.0` is the untouched baseline plan. Only `idx` moves — the
+    slot table, the series choice, `pos`, the flip and `valid` are all phase-invariant, so
+    the S variant bags differ ONLY in which already-decoded slices get stacked.
     """
     ops = canonical_ops_for(side)
     flip_planes = tuple(ops.get("flip_lr_planes", ()) or ())
@@ -451,7 +539,7 @@ def plan_slots(
             continue
         n = int(sel.rec.n)
         idxs = [min(n - 1, max(0, int(math.floor(f * n))))
-                for f in _slot_fracs(sel.n_want, train, rng, jitter)]
+                for f in _slot_fracs(sel.n_want, train, rng, jitter, phase)]
         if n < sel.n_want:
             FALLBACKS["padded"] += 1
         if rev_sag and sel.plane == "Sagittal":
@@ -470,10 +558,35 @@ def plan_study(
     train: bool = False,
     rng: Optional[np.random.Generator] = None,
     jitter: float = V2_JITTER,
+    phase: float = 0.0,
 ) -> Tuple[List[SlotSel], List[SlotPick]]:
     """`select_slot_series` then `plan_slots` — the whole plan for one study."""
     sels = select_slot_series(recs, k_scale=k_scale, train=train, rng=rng)
-    return sels, plan_slots(sels, side=side, train=train, rng=rng, jitter=jitter)
+    return sels, plan_slots(sels, side=side, train=train, rng=rng, jitter=jitter, phase=phase)
+
+
+def slot_instance_uids_v2(
+    recs: Sequence[SeriesRecV2],
+    side: str = CANONICAL_SIDE,
+    k_scale: float = 1.0,
+    phase: float = 0.0,
+) -> List[str]:
+    """The K InstanceUIDs one eval plan picks — `""` for a masked (missing-plane) position.
+
+    Cache-independent (basename minus extension), which is what makes it the right currency
+    for the phase-0 bit-identity proof in `dev/smoke_v2_tta.sh`: it compares WHICH SLICES are
+    stacked, not the pixels a particular cache holds.
+    """
+    by_uid = {r.series: r for r in recs}
+    _sels, picks = plan_study(recs, side=side, k_scale=k_scale, train=False, phase=phase)
+    out: List[str] = []
+    for p in picks:
+        rec = by_uid.get(p.series) if p.series is not None else None
+        if not p.valid or rec is None or not rec.paths:
+            out.append("")
+            continue
+        out.append(stem_of(rec.paths[min(p.idx, len(rec.paths) - 1)]))
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -582,6 +695,7 @@ class StudyBagDatasetV2(Dataset):
         side_map: Optional[Dict[str, str]] = None,
         jitter: float = V2_JITTER,
         augment: bool = True,
+        phase: float = 0.0,
     ):
         self.study_ids = [str(s) for s in study_ids if str(s) in index]
         self.index = index
@@ -594,6 +708,12 @@ class StudyBagDatasetV2(Dataset):
         self.k = slot_total(self.k_scale)
         self.jitter = float(jitter)
         self.augment = bool(augment)
+        # Eval-only slot-phase TTA (`variant_phases`); 0.0 = the baseline sampling. A train
+        # dataset must stay at 0.0: its own jitter already resamples the grid every epoch.
+        self.phase = float(phase)
+        if self.train and self.phase:
+            raise ValueError("phase != 0 is an EVAL-only TTA knob (train jitter already "
+                             "resamples the grid); got train=True")
         self.side_map = dict(side_map or {})
         self._slot_id = slot_id_vector(self.k_scale)
 
@@ -620,7 +740,7 @@ class StudyBagDatasetV2(Dataset):
         tr = self.train if train is None else bool(train)
         rng = np.random.default_rng(self.seed + i)
         sels, picks = plan_study(self.index[sid], side=self.side_of(sid), k_scale=self.k_scale,
-                                 train=tr, rng=rng, jitter=self.jitter)
+                                 train=tr, rng=rng, jitter=self.jitter, phase=self.phase)
         return sels, picks, self.side_of(sid)
 
     def _blank(self) -> np.ndarray:
@@ -637,7 +757,8 @@ class StudyBagDatasetV2(Dataset):
         recs = self.index[sid]
         by_uid = {r.series: r for r in recs}
         _sels, picks = plan_study(recs, side=self.side_of(sid), k_scale=self.k_scale,
-                                  train=self.train, rng=rng, jitter=self.jitter)
+                                  train=self.train, rng=rng, jitter=self.jitter,
+                                  phase=self.phase)
 
         size = self.size
         bag = np.zeros((self.k, 3, size, size), dtype=np.float32)
@@ -674,7 +795,8 @@ __all__ = [
     "V2_CROP_MM", "V2_PCT", "V2_JITTER", "CANONICAL_SIDE",
     "SeriesRecV2", "SlotSel", "SlotPick", "StudyBagDatasetV2",
     "build_index_v2", "default_index_cache_v2", "load_labels_v2", "load_side_map",
-    "canonical_ops_for", "select_slot_series", "plan_slots", "plan_study",
+    "canonical_ops_for", "select_slot_series", "plan_slots", "plan_study", "slot_instance_uids_v2",
+    "V2_PHASE_LADDER", "variant_phases", "variant_label", "variant_index_of",
     "scaled_slot_counts", "slot_total", "slot_id_vector", "fallback_report", "FALLBACKS",
     "W_COLS", "IMAGENET_MEAN", "IMAGENET_STD",
 ]

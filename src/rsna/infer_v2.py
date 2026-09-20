@@ -36,6 +36,26 @@ THE DICOM PATH, PER STUDY (the ordering of these steps is load-bearing)
 Members of different `size` share the 384 decode and differ only by an INTER_AREA resize,
 which is exactly what `dataset_v2` does when trained at `--size 336` off the 384 cache.
 
+SLOT-PHASE TTA (`tta=S`, reports/tta_v2.md)
+-------------------------------------------
+`predict_studies_v2(..., tta=S)` evaluates the same ensemble over S deterministic slot-phase
+variants (`dataset_v2.variant_phases(S)`: 0, +1/3, -1/3, ... slot spacings) and per-column
+rank-averages the S finished frames with the SAME combiner the other arms use
+(`infer_tta.rank_average_variant_frames`, which `dev/tta_eval.py --check-combiner` pins to
+`infer_plane.rank_average_frames`). Variant 0 is the baseline phase and `S=1` returns that
+frame untransformed, so `tta=1` is byte-identical to the pre-TTA predictor.
+
+    ONE DECODE, S BAGS. A phase changes only WHICH slice indices of an already-decoded series
+    are stacked (`dataset_v2.plan_slots` docstring), so step 3 above runs once per study and
+    steps 6-7 run S times over the same `vols`. Kaggle cost is therefore S x the v2 FORWARD
+    plus S x a memcpy-cheap assemble — the decode, which is the expensive half on a CPU-bound
+    kernel, is unchanged. `[time] stage=v2_decode` stays flat while `stage=v2_forward` scales
+    with S; that is the check `dev/smoke_v2_tta.sh` makes.
+
+    (On the CACHE path there is no per-study decode — `StudyBagDatasetV2` reads one cached
+    JPEG per picked slice — so there the S variants simply re-read the picked slices, exactly
+    as `infer_tta` does for the base/hr arms.)
+
 Reused verbatim from the existing arms: `infer_hr._forward_with_guard` (fp32 recompute on a
 dead half-precision engine or a non-finite output), `infer.write_benchmark_submission` /
 `write_submission` / `find_data_root`, the device probe, and the advisory fingerprint check.
@@ -74,6 +94,9 @@ from .dataset_v2 import (
     load_side_map,
     plan_slots,
     select_slot_series,
+    variant_index_of,
+    variant_label,
+    variant_phases,
 )
 from .infer import (  # reused verbatim -- no duplication, no edit to infer.py
     FINGERPRINT_TOL,
@@ -258,7 +281,7 @@ def _study_series_records(root: str, split: str, rows_by_study, study: str) -> L
     return recs
 
 
-def build_study_stack_dicom(
+def decode_study_series(
     root: str,
     split: str,
     study: str,
@@ -267,11 +290,16 @@ def build_study_stack_dicom(
     pct: Sequence[float] = V2_PCT,
     verbose: bool = False,
     timers: Optional[Dict[str, float]] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, str]:
-    """One study -> `(stack uint8 [K,384,384], slot_id [K], pos [K], valid [K], side, source)`.
+) -> Tuple[List, Dict[str, np.ndarray], Dict[str, np.ndarray], str, str]:
+    """Steps 1-5 -> `(sels, vols, anat, side, source)`. THE EXPENSIVE HALF, run ONCE per study.
 
-    Steps 1-7 of the module docstring. Every chosen series is decoded once and in full
-    (the percentile normalisation is per SERIES); nothing else is touched.
+    `select_slot_series` picks at most 5 series; each is decoded once and IN FULL (the
+    percentile normalisation is per SERIES), its anatomical order read from the DICOM headers,
+    and the laterality taken from the metas the decode already returned.
+
+    `plan_slots` is deliberately NOT called here. The S slot-phase TTA variants differ only in
+    which indices of these same `vols` get stacked, so they all reuse this one decode —
+    `assemble_stack` is the cheap half that runs S times.
 
     `series_rows` is `group_series_rows(<split>_series.csv)` (or the raw DataFrame, which is
     grouped on the spot — pass the dict in a loop).
@@ -302,9 +330,26 @@ def build_study_stack_dicom(
     if timers is not None:
         timers["decode"] = timers.get("decode", 0.0) + (time.time() - t)
 
-    t = time.time()
     side, source, _x = _side_from_metas(metas_all) if metas_all else (CANONICAL_SIDE, "no-meta", 0.0)
-    picks = plan_slots(sels, side=side, train=False)
+    return sels, vols, anat, side, source
+
+
+def assemble_stack(
+    sels: Sequence,
+    vols: Dict[str, np.ndarray],
+    anat: Dict[str, np.ndarray],
+    side: str = CANONICAL_SIDE,
+    phase: float = 0.0,
+    timers: Optional[Dict[str, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Steps 6-7 for ONE slot phase -> `(stack uint8 [K,384,384], slot_id, pos, valid)`.
+
+    Pure indexing + an optional horizontal flip over volumes `decode_study_series` already
+    produced: no pixels are re-read and nothing is re-decoded, which is what makes S-variant
+    TTA cost S x forward rather than S x everything. `phase=0.0` is the baseline plan.
+    """
+    t = time.time()
+    picks = plan_slots(sels, side=side, train=False, phase=phase)
     k = len(picks)
     stack = np.zeros((k, CACHE_SIZE, CACHE_SIZE), dtype=np.uint8)
     slot_id = np.zeros(k, dtype=np.int64)
@@ -329,6 +374,31 @@ def build_study_stack_dicom(
         valid[j] = True
     if timers is not None:
         timers["assemble"] = timers.get("assemble", 0.0) + (time.time() - t)
+    return stack, slot_id, pos, valid
+
+
+def build_study_stack_dicom(
+    root: str,
+    split: str,
+    study: str,
+    series_rows,
+    crop_mm: float = V2_CROP_MM,
+    pct: Sequence[float] = V2_PCT,
+    verbose: bool = False,
+    timers: Optional[Dict[str, float]] = None,
+    phase: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, str]:
+    """One study -> `(stack uint8 [K,384,384], slot_id [K], pos [K], valid [K], side, source)`.
+
+    Steps 1-7 of the module docstring = `decode_study_series` + `assemble_stack`, i.e. exactly
+    what this function has always done (`phase=0.0` -> the baseline positions). Kept as the
+    one-shot entry point for callers that want a single bag; the S-variant predictor calls the
+    two halves separately so the decode is paid once.
+    """
+    sels, vols, anat, side, source = decode_study_series(
+        root, split, study, series_rows, crop_mm=crop_mm, pct=pct, verbose=verbose, timers=timers)
+    stack, slot_id, pos, valid = assemble_stack(sels, vols, anat, side=side, phase=phase,
+                                                timers=timers)
     return stack, slot_id, pos, valid, side, source
 
 
@@ -385,6 +455,38 @@ def _is_dicom_root(root: str, split: str) -> bool:
     return False
 
 
+def _lbl_idx(pos: int, phase: float) -> int:
+    """Ladder index of `phase` when it has one, else its position in the requested list."""
+    i = variant_index_of(phase)
+    return i if i >= 0 else int(pos)
+
+
+def _combine_variants_v2(frames: Dict[int, pd.DataFrame], phases: Sequence[float],
+                         tta_combine: str, verbose: bool = True) -> pd.DataFrame:
+    """Per-column rank (or prob) average of the S variant frames — one combiner, repo-wide.
+
+    `infer_tta.rank_average_variant_frames` is the SAME function the base/hr arms combine
+    their TTA frames with (and `dev/tta_eval.py --check-combiner` asserts it agrees with
+    `infer_plane.rank_average_frames`, the across-arm combiner). Imported lazily so this
+    module keeps its current import graph — and so the Kaggle bundle, which inlines `infer_v2`
+    BEFORE `infer_tta`, resolves the name from the flat namespace at CALL time (the stripper
+    deletes the relative import; `reports/multi_notebook_v2.md` §1).
+
+    S=1 returns the single frame untouched: no rank transform, no reordering, so `tta=1` is
+    byte-identical to the pre-TTA predictor.
+    """
+    ordered = [frames[i] for i in range(len(phases))]
+    if len(ordered) == 1:
+        return ordered[0]
+    from .infer_tta import rank_average_variant_frames
+
+    if verbose:
+        counts = {f"v{i}": len(f) for i, f in enumerate(ordered)}
+        print(f"[tta] v2: combining {len(ordered)} variant frame(s) by {tta_combine}-average; "
+              f"rows {counts}")
+    return rank_average_variant_frames(ordered, mode=tta_combine)
+
+
 @torch.no_grad()
 def predict_studies_v2(
     members: Sequence[MemberV2],
@@ -400,7 +502,11 @@ def predict_studies_v2(
     order_parquet: Optional[str] = None,
     dicom_root: Optional[str] = None,
     verbose_decode: bool = False,
-) -> pd.DataFrame:
+    tta: Union[int, Sequence[float]] = 1,
+    tta_combine: str = "rank",
+    return_frames: bool = False,
+    index=None,
+):
     """Ensemble prediction -> DataFrame `[ID_COL + 12 columns]`, one row per study.
 
     Two input paths, chosen automatically:
@@ -409,6 +515,14 @@ def predict_studies_v2(
       * a **cache root** (`data/cache_c140_384`, split `train`): the training dataset itself,
         with `k_scale=1.0` and the side parquet — the OOF-style evaluation path.
 
+    `tta=S` evaluates `dataset_v2.variant_phases(S)` slot phases and combines the S finished
+    frames by `tta_combine` ("rank" — the same per-column rank average every other arm uses —
+    or "prob"). On the DICOM path the S bags share ONE decode per study. `tta=1` is the literal
+    pre-TTA path. `tta` also accepts an explicit list of phases (so a resumable evaluator can
+    recompute just the variants it is missing, the way `infer_tta` takes a variant list);
+    `return_frames=True` then also returns `{position_in_that_list: frame}`. `index=` reuses a
+    prebuilt `build_index_v2` manifest on the cache path.
+
     The returned frame is exactly the shape `infer_plane.rank_average_frames` consumes, so
     this arm joins the multi-arm rank ensemble with no adapter.
     """
@@ -416,9 +530,15 @@ def predict_studies_v2(
         raise ValueError("no members")
     if mode not in ("prob", "rank"):
         raise ValueError(f"mode must be 'prob' or 'rank', got {mode!r}")
+    if tta_combine not in ("rank", "prob"):
+        raise ValueError(f"tta_combine must be 'rank' or 'prob', got {tta_combine!r}")
     w = np.ones(len(members)) if weights is None else np.asarray(weights, dtype=np.float64)
     if len(w) != len(members):
         raise ValueError("weights must match members")
+    phases = (variant_phases(max(1, int(tta))) if isinstance(tta, (int, np.integer))
+              else [float(p) for p in tta])
+    if not phases:
+        raise ValueError("tta: no variants")
 
     root = next(iter(input_root.values())) if isinstance(input_root, Mapping) else str(input_root)
     groups: Dict[Tuple, List[int]] = {}
@@ -426,16 +546,23 @@ def predict_studies_v2(
         groups.setdefault(m.signature, []).append(i)
     print(f"[predict] {len(members)} v2 member(s) in {len(groups)} size group(s): "
           f"{[(sig[0], len(ix)) for sig, ix in groups.items()]} (size, n)")
+    if len(phases) > 1:
+        print(f"[tta] v2: S={len(phases)} slot phase(s), {tta_combine}-averaged across variants")
+        for i, ph in enumerate(phases):
+            print(f"   {variant_label(_lbl_idx(i, ph), ph)}")
 
     if _is_dicom_root(root, split):
-        return _predict_dicom(members, root, split, groups, batch, device, study_ids, mode, w,
-                              verbose_decode)
-    return _predict_cache(members, root, split, groups, batch, workers, device, study_ids,
-                          mode, w, side_parquet, order_parquet, dicom_root)
+        frames = _predict_dicom(members, root, split, groups, batch, device, study_ids, mode, w,
+                                verbose_decode, phases)
+    else:
+        frames = _predict_cache(members, root, split, groups, batch, workers, device, study_ids,
+                                mode, w, side_parquet, order_parquet, dicom_root, phases, index)
+    combined = _combine_variants_v2(frames, phases, tta_combine)
+    return (combined, frames) if return_frames else combined
 
 
 def _predict_dicom(members, root, split, groups, batch, device, study_ids, mode, w,
-                   verbose_decode) -> pd.DataFrame:
+                   verbose_decode, phases=(0.0,)) -> Dict[int, pd.DataFrame]:
     series_csv = os.path.join(root, f"{split}_series.csv")
     series_rows = group_series_rows(pd.read_csv(series_csv))
     base = os.path.join(root, f"{split}_series")
@@ -449,90 +576,120 @@ def _predict_dicom(members, root, split, groups, batch, device, study_ids, mode,
     print(f"[predict] DICOM path: {len(ids)} studies from {root} "
           f"(crop_mm={m0.crop_mm} pct={m0.pct} K={K_FULL})")
 
+    # Buffers are keyed by (variant, decode-group). They hold the uint8 [K,384,384] stacks,
+    # NOT the normalised float tensors: at S=3 x batch 2 that is ~56 MB instead of ~680 MB,
+    # and `_stack_to_tensor` is a pure function of the stack, so moving the call into flush()
+    # changes no number (the S=1 output stays byte-identical).
+    S = len(phases)
     timers: Dict[str, float] = {}
-    per_member: Dict[int, List[np.ndarray]] = {i: [] for i in range(len(members))}
+    per_member: Dict[Tuple[int, int], List[np.ndarray]] = {(v, i): []
+                                                           for v in range(S)
+                                                           for i in range(len(members))}
     order_ids: List[str] = []
-    buf: Dict[Tuple, List[np.ndarray]] = {sig: [] for sig in groups}
-    buf_meta: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    buf: Dict[int, List[np.ndarray]] = {v: [] for v in range(S)}
+    buf_meta: Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {v: [] for v in range(S)}
 
     def flush():
-        if not buf_meta:
+        if not buf_meta[0]:
             return
-        sid = torch.from_numpy(np.stack([b[0] for b in buf_meta])).to(device)
-        pos = torch.from_numpy(np.stack([b[1] for b in buf_meta])).to(device)
-        val = torch.from_numpy(np.stack([b[2] for b in buf_meta])).to(device)
         t = time.time()
-        for sig, idxs in groups.items():
-            x = torch.from_numpy(np.stack(buf[sig])).to(device, non_blocking=True)
-            for i in idxs:
-                logits = _forward_with_guard(members[i].model, x, device,
-                                             slot_id=sid, pos=pos, valid=val)
-                per_member[i].append(torch.sigmoid(logits.float()).cpu().numpy())
-            buf[sig].clear()
+        for v in range(S):
+            sid = torch.from_numpy(np.stack([b[0] for b in buf_meta[v]])).to(device)
+            pos = torch.from_numpy(np.stack([b[1] for b in buf_meta[v]])).to(device)
+            val = torch.from_numpy(np.stack([b[2] for b in buf_meta[v]])).to(device)
+            for sig, idxs in groups.items():
+                mm = members[idxs[0]]
+                x = torch.from_numpy(np.stack([_stack_to_tensor(s, mm.size, mm.mean, mm.std)
+                                               for s in buf[v]])).to(device, non_blocking=True)
+                for i in idxs:
+                    logits = _forward_with_guard(members[i].model, x, device,
+                                                 slot_id=sid, pos=pos, valid=val)
+                    per_member[(v, i)].append(torch.sigmoid(logits.float()).cpu().numpy())
+                del x
+            buf[v].clear()
+            buf_meta[v].clear()
         timers["forward"] = timers.get("forward", 0.0) + (time.time() - t)
-        buf_meta.clear()
 
     for n, study in enumerate(ids):
-        stack, slot_id, pos, valid, side, source = build_study_stack_dicom(
+        # ONE decode per study, shared by every variant (and by every size group).
+        sels, vols, anat, side, source = decode_study_series(
             root, split, study, series_rows, crop_mm=m0.crop_mm, pct=m0.pct,
             verbose=verbose_decode, timers=timers)
+        n_valid = 0
+        for v, ph in enumerate(phases):
+            stack, slot_id, pos, valid = assemble_stack(sels, vols, anat, side=side, phase=ph,
+                                                        timers=timers)
+            buf[v].append(stack)
+            buf_meta[v].append((slot_id, pos, valid))
+            n_valid = int(valid.sum()) if v == 0 else n_valid
+        del vols, anat
         print(f"  [study {n + 1}/{len(ids)}] {study[-12:]} side={side} ({source}) "
-              f"valid={int(valid.sum())}/{len(valid)}", flush=True)
-        for sig, idxs in groups.items():
-            mm = members[idxs[0]]
-            buf[sig].append(_stack_to_tensor(stack, mm.size, mm.mean, mm.std))
-        buf_meta.append((slot_id, pos, valid))
+              f"valid={n_valid}/{K_FULL}" + (f" x{S} variants" if S > 1 else ""), flush=True)
         order_ids.append(str(study))
-        if len(buf_meta) >= max(1, int(batch)):
+        if len(buf_meta[0]) >= max(1, int(batch)):
             flush()
     flush()
-    print(" ", fallback_report())
+    print(" ", fallback_report()
+          + (f"  [padded counts each of the {S} variants separately]" if S > 1 else ""))
     for k_, v_ in sorted(timers.items()):
         print(f"[time] stage=v2_{k_} elapsed={v_:.1f}s", flush=True)
 
-    frames = {i: pd.DataFrame(
-        np.concatenate(per_member[i], axis=0) if per_member[i]
-        else np.zeros((0, len(TARGETS)), np.float32),
-        columns=TARGETS, index=order_ids) for i in range(len(members))}
-    return _combine_v2(frames, order_ids, w, mode)
+    out: Dict[int, pd.DataFrame] = {}
+    for v in range(S):
+        frames = {i: pd.DataFrame(
+            np.concatenate(per_member[(v, i)], axis=0) if per_member[(v, i)]
+            else np.zeros((0, len(TARGETS)), np.float32),
+            columns=TARGETS, index=order_ids) for i in range(len(members))}
+        out[v] = _combine_v2(frames, order_ids, w, mode)
+    return out
 
 
 def _predict_cache(members, root, split, groups, batch, workers, device, study_ids, mode, w,
-                   side_parquet, order_parquet, dicom_root) -> pd.DataFrame:
+                   side_parquet, order_parquet, dicom_root, phases=(0.0,),
+                   index=None) -> Dict[int, pd.DataFrame]:
     from .order import SliceOrderResolver
 
-    resolver = SliceOrderResolver.from_parquet(order_parquet, dicom_root=dicom_root, split=split)
-    index = build_index_v2(root, split=split, order=resolver)
+    if index is None:
+        resolver = SliceOrderResolver.from_parquet(order_parquet, dicom_root=dicom_root,
+                                                   split=split)
+        index = build_index_v2(root, split=split, order=resolver)
     side_map = load_side_map(side_parquet)
     ids = list(index.keys()) if study_ids is None else \
         [str(s) for s in study_ids if str(s) in index]
-    per_member: Dict[int, pd.DataFrame] = {}
-    order_ids: Optional[List[str]] = None
-    for sig, idxs in groups.items():
-        m0 = members[idxs[0]]
-        ds = StudyBagDatasetV2(ids, index, labels=None, size=m0.size, train=False,
-                               mean=np.asarray(m0.mean).ravel(), std=np.asarray(m0.std).ravel(),
-                               k_scale=1.0, side_map=side_map)
-        loader = DataLoader(ds, batch_size=max(1, int(batch)), shuffle=False,
-                            num_workers=workers, pin_memory=str(device).startswith("cuda"))
-        print(f"[predict] cache path: group size={m0.size}, {len(ds)} studies from {root}")
-        got: List[str] = []
-        chunks: Dict[int, List[np.ndarray]] = {i: [] for i in idxs}
-        for x, sid_t, pos, valid, _y, _w, sid in loader:
-            x = x.to(device, non_blocking=True)
-            kw = dict(slot_id=sid_t.to(device), pos=pos.to(device), valid=valid.to(device))
+    out: Dict[int, pd.DataFrame] = {}
+    # No per-study decode here: the dataset reads ONE cached JPEG per picked slice, so a
+    # variant costs one loader pass over the picked slices (there is nothing to re-decode).
+    for v, ph in enumerate(phases):
+        per_member: Dict[int, pd.DataFrame] = {}
+        order_ids: Optional[List[str]] = None
+        for sig, idxs in groups.items():
+            m0 = members[idxs[0]]
+            ds = StudyBagDatasetV2(ids, index, labels=None, size=m0.size, train=False,
+                                   mean=np.asarray(m0.mean).ravel(),
+                                   std=np.asarray(m0.std).ravel(),
+                                   k_scale=1.0, side_map=side_map, phase=ph)
+            loader = DataLoader(ds, batch_size=max(1, int(batch)), shuffle=False,
+                                num_workers=workers, pin_memory=str(device).startswith("cuda"))
+            print(f"[predict] cache path: group size={m0.size}, {len(ds)} studies from {root}"
+                  + (f" [{variant_label(_lbl_idx(v, ph), ph)}]" if len(phases) > 1 else ""))
+            got: List[str] = []
+            chunks: Dict[int, List[np.ndarray]] = {i: [] for i in idxs}
+            for x, sid_t, pos, valid, _y, _w, sid in loader:
+                x = x.to(device, non_blocking=True)
+                kw = dict(slot_id=sid_t.to(device), pos=pos.to(device), valid=valid.to(device))
+                for i in idxs:
+                    logits = _forward_with_guard(members[i].model, x, device, **kw)
+                    chunks[i].append(torch.sigmoid(logits.float()).cpu().numpy())
+                got.extend(list(sid))
             for i in idxs:
-                logits = _forward_with_guard(members[i].model, x, device, **kw)
-                chunks[i].append(torch.sigmoid(logits.float()).cpu().numpy())
-            got.extend(list(sid))
-        for i in idxs:
-            arr = np.concatenate(chunks[i], axis=0) if chunks[i] else \
-                np.zeros((0, len(TARGETS)), np.float32)
-            per_member[i] = pd.DataFrame(arr, columns=TARGETS, index=[str(s) for s in got])
-        if order_ids is None:
-            order_ids = [str(s) for s in got]
+                arr = np.concatenate(chunks[i], axis=0) if chunks[i] else \
+                    np.zeros((0, len(TARGETS)), np.float32)
+                per_member[i] = pd.DataFrame(arr, columns=TARGETS, index=[str(s) for s in got])
+            if order_ids is None:
+                order_ids = [str(s) for s in got]
+        out[v] = _combine_v2(per_member, order_ids or [], w, mode)
     print(" ", fallback_report())
-    return _combine_v2(per_member, order_ids or [], w, mode)
+    return out
 
 
 # --------------------------------------------------------------------------------------
@@ -549,6 +706,8 @@ def run_submission_v2(
     side_parquet: Optional[str] = None,
     order_parquet: Optional[str] = None,
     dicom_root: Optional[str] = None,
+    tta: int = 1,
+    tta_combine: str = "rank",
 ) -> pd.DataFrame:
     """Survival flow: 0.5 file FIRST -> mount -> device probe -> members -> predict -> write."""
     t = time.time()
@@ -609,7 +768,8 @@ def run_submission_v2(
     preds = predict_studies_v2(members, input_root, split, batch=batch, workers=workers,
                                device=device, study_ids=test_df[ID_COL].astype(str).tolist(),
                                mode=mode, weights=weights, side_parquet=side_parquet,
-                               order_parquet=order_parquet, dicom_root=dicom_root)
+                               order_parquet=order_parquet, dicom_root=dicom_root,
+                               tta=tta, tta_combine=tta_combine)
     _stage_v2("predict[v2]", t)
 
     # 4) rank + reindex + fillna(0.5) + write
@@ -636,13 +796,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--side-parquet", default=None)
     ap.add_argument("--order-parquet", default=None)
     ap.add_argument("--dicom-root", default=None)
+    ap.add_argument("--tta", type=int, default=1,
+                    help="S slot-phase variants (dataset_v2.variant_phases); 1 = off and "
+                         "byte-identical to the pre-TTA path")
+    ap.add_argument("--tta-combine", default="rank", choices=("rank", "prob"))
     a = ap.parse_args(argv)
 
     sub = run_submission_v2(input_root=a.input_root, checkpoint_paths=a.ckpt,
                             output_path=a.out, batch=a.batch, workers=a.workers,
                             device=a.device, mode=a.member_mode, split=a.split,
                             side_parquet=a.side_parquet, order_parquet=a.order_parquet,
-                            dicom_root=a.dicom_root)
+                            dicom_root=a.dicom_root, tta=a.tta, tta_combine=a.tta_combine)
     print(sub.head().to_string())
     n_unique = sub[TARGETS].round(6).drop_duplicates().shape[0]
     print(f"[check] rows={len(sub)} cols={len(sub.columns)} distinct prediction rows={n_unique}")
@@ -656,5 +820,5 @@ if __name__ == "__main__":  # pragma: no cover
 __all__ = [
     "MemberV2", "load_members_v2", "predict_studies_v2", "run_submission_v2", "is_v2_meta",
     "check_fingerprint_v2", "compute_fingerprint_v2", "build_study_stack_dicom",
-    "has_read_series_v2", "MODE_TAG_V2", "CACHE_SIZE",
+    "decode_study_series", "assemble_stack", "has_read_series_v2", "MODE_TAG_V2", "CACHE_SIZE",
 ]

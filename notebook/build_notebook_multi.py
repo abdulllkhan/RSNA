@@ -64,15 +64,18 @@ Slot-sampling TTA (`RSNA_TTA`, reports/tta_tooling.md):
     shift of the eval slot grid), and per-column rank-averages the S frames BEFORE the arm frame
     enters the across-arm combiner. `variant 0 IS the baseline sampling`, so **S=1 is the literal
     code path this notebook ran before TTA existed** — byte-identical output, proven by md5.
-  * Only `base` (via `infer_tta.predict_studies_base_tta`, wrapping the exact v7 combiner) and
-    `hr` (via `infer_tta.predict_studies_tta`) have TTA wrappers. `plane` has its own per-plane
-    sampler; `25d`/`ordered` build their slots through samplers `tta.dataset_factory` has no
-    wrapper for (and `ordered`'s coverage="center" bypasses `_pick_positions` entirely, so a
-    variant would be a silent no-op); `v2` picks its positions in `dataset_v2._slot_fracs`,
-    which `tta.dataset_factory` also does not wrap, and its DICOM predictor takes members
-    first and never builds a Dataset at all. Those four arms are pinned to S=1 and say so.
-  * Cost is ~linear in S (decode AND forward repeat). Do not raise S without an OOF measurement
-    (reports/tta_tooling.md §6: the bar is >= +0.005 macro on both anchors).
+  * `base` (via `infer_tta.predict_studies_base_tta`, wrapping the exact v7 combiner), `hr`
+    (via `infer_tta.predict_studies_tta`) and `v2` (via `infer_v2.predict_studies_v2(tta=S)`,
+    which shifts the SLOT PHASE in `dataset_v2.plan_slots` — reports/tta_v2.md) have TTA.
+    `plane` has its own per-plane sampler; `25d`/`ordered` build their slots through samplers
+    `tta.dataset_factory` has no wrapper for (and `ordered`'s coverage="center" bypasses
+    `_pick_positions` entirely, so a variant would be a silent no-op). Those three arms are
+    pinned to S=1 and say so.
+  * Cost for base/hr is ~linear in S (decode AND forward repeat). For `v2` it is S x FORWARD
+    only: the S variant bags are assembled from ONE decode per study, because a slot phase
+    changes only which already-decoded slices are stacked. Do not raise S without an OOF
+    measurement (reports/tta_tooling.md §6 / reports/tta_v2.md: the bar is >= +0.005 macro on
+    both anchors).
 
 Env / config (all optional; the Kaggle defaults are the fallbacks):
     RSNA_INPUT_ROOT   data mount (default: scan /kaggle/input for test.csv + test_series/)
@@ -86,7 +89,7 @@ Env / config (all optional; the Kaggle defaults are the fallbacks):
     RSNA_MEMBER_MODE  prob|rank, within-arm combiner for hr/25d/ordered/v2/plane (default prob)
     RSNA_TTA          slot-sampling TTA: S samplings per arm, 1 = off (default 1).
                       Global ("3") or per arm ("base:3,hr:2"); a bare number sets the default
-                      for every arm and `arm:S` overrides one. base + hr only (see below).
+                      for every arm and `arm:S` overrides one. base + hr + v2 only (see below).
     RSNA_TTA_COMBINE  rank|prob, across-variant combiner (default rank)
 
 Run:  .venv/bin/python notebook/build_notebook_multi.py
@@ -338,14 +341,15 @@ MEMBER_MODE = os.environ.get("RSNA_MEMBER_MODE", "prob").strip().lower()  # with
 
 ARM_ORDER = ("base", "hr", "25d", "ordered", "v2", "plane")
 
-# Arms with a slot-sampling TTA wrapper (reports/tta_tooling.md §7). `plane` has its own
-# per-plane sampler; `25d`/`ordered` sample through code `tta.dataset_factory` has no wrapper
-# for -- and `ordered`'s coverage="center" does not go through `_pick_positions` at all, so a
-# variant there would be a silent no-op. `v2` picks positions in `dataset_v2._slot_fracs`
-# (also unwrapped), and on the DICOM mount it builds no Dataset at all -- `predict_studies_v2`
-# assembles the bag itself -- so there is nothing for `tta.dataset_factory` to wrap.
-# Those four are pinned to S=1 and say so in the log.
-TTA_CAPABLE = ("base", "hr")
+# Arms with a slot-sampling TTA wrapper (reports/tta_tooling.md §7, reports/tta_v2.md).
+# `base`/`hr` go through `tta.dataset_factory`; `v2` does NOT -- it needs none, because its
+# positions come from `dataset_v2.plan_slots`, which now takes a `phase` directly, and
+# `predict_studies_v2(tta=S)` assembles the S bags from ONE decode per study.
+# `plane` has its own per-plane sampler; `25d`/`ordered` sample through code
+# `tta.dataset_factory` has no wrapper for -- and `ordered`'s coverage="center" does not go
+# through `_pick_positions` at all, so a variant there would be a silent no-op.
+# Those three are pinned to S=1 and say so in the log.
+TTA_CAPABLE = ("base", "hr", "v2")
 
 
 def parse_arm_weights(spec, default=1.0):
@@ -704,8 +708,13 @@ def run_arm(arm, paths, root, device, study_ids):
             # Members of several `size` values share ONE 384 decode per study and differ only
             # by the INTER_AREA resize in `_stack_to_tensor` (they are grouped by
             # MemberV2.signature = (size, mean, std)), so a 384 + 336 mix costs one decode.
+            # `tta=S` shares that same decode across the S slot-phase variants too, so S
+            # multiplies the v2 FORWARD only -- `[time] stage=v2_decode` stays flat while
+            # `stage=v2_forward` scales with S (reports/tta_v2.md). S=1 is the literal
+            # pre-TTA call.
             out = predict_studies_v2(members, root, "test", batch=b, workers=WORKERS,
-                                     device=device, study_ids=study_ids, mode=MEMBER_MODE)
+                                     device=device, study_ids=study_ids, mode=MEMBER_MODE,
+                                     tta=S, tta_combine=TTA_COMBINE)
             _stage("predict[v2]", _t)
             return out
         if arm == "plane":
@@ -888,9 +897,10 @@ def make_notebook(bundle: str, driver: str) -> dict:
            "DICOM headers, and v2 also reads laterality from them - neither\n"
            "`data/series_order.parquet` nor `data/study_side.parquet` may be shipped.\n"
            "\n"
-           "`RSNA_TTA` (default 1 = off, byte-identical to no TTA) runs the base and hr arms\n"
-           "over S slot-sampling variants and rank-averages them inside the arm; S can be set\n"
-           "globally (`3`) or per arm (`base:3,hr:2`). Cost is ~linear in S.\n"
+           "`RSNA_TTA` (default 1 = off, byte-identical to no TTA) runs the base, hr and v2\n"
+           "arms over S slot-sampling variants and rank-averages them inside the arm; S can be\n"
+           "set globally (`3`) or per arm (`base:3,v2:2`). Cost is ~linear in S for base/hr;\n"
+           "for v2 it is S x forward only (the S bags share one decode per study).\n"
            "\n"
            "Survival patterns kept from v7: 0.5 file first, mount discovery, self-size to the\n"
            "hidden test, `pretrained=False` weight load, device probe with CPU fallback,\n"
