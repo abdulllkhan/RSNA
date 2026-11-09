@@ -11,7 +11,8 @@
     "rsna-knee-abnormality-detection"
   ],
   "dataset_sources": [
-    "abdullllkhan/rsna-knee-weights-v1"
+    "abdullllkhan/rsna-knee-weights-v1",
+    "goodpjw2008/rsna-knee-2-5d-convnext-reader"
   ],
   "kernel_sources": []
 }

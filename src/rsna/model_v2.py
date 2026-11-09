@@ -41,6 +41,14 @@ MEMORY KNOBS. `--slice-chunk N` forwards the B*K slices through the backbone N a
 chunk's activations in the backward pass (roughly trades 1.3x compute for ~K/chunk less
 activation memory). Both are no-ops at inference except for the chunking itself.
 
+`block_ckpt` (`train_v2 --block-ckpt 1`, default OFF) is the public Raptor trainers' knob
+instead: timm's own PER-BLOCK checkpointing (`backbone.set_grad_checkpointing(True)`), so ONE
+backbone call over all B*K slices (e.g. 8 studies x 12 = 96) stores only each block's input and
+recomputes the block in the backward pass. It is switched on only while the module is training
+with grad enabled — eval / inference / the fingerprint never checkpoint — and with the flag off
+nothing in this file runs differently (no call into timm at all). It cannot be combined with the
+chunk-level `grad_ckpt` (nested recompute would buy nothing and double the cost).
+
 A NOTE ON THE PARAMETER NAMED `plane_logits`. It is the (optional, zero-initialised) LEARNED
 per-finding x slot bias added to the fixed prior — the same object `model_plane` calls
 `plane_logits`, over slots instead of planes. It is deliberately given that name because
@@ -124,6 +132,7 @@ class ModelV2Config:
     grad_ckpt: bool = False
     slice_chunk: int = 0            # 0 = all B*K slices in one backbone call
     channels_last: Optional[bool] = None   # None -> auto (CNN yes, ViT no)
+    block_ckpt: bool = False        # timm per-block grad checkpointing (training only); see docstring
 
 
 def _is_vit(name: str) -> bool:
@@ -226,6 +235,14 @@ class StudyModelV2(nn.Module):
         self.head_b = nn.Parameter(torch.zeros(cfg.n_classes))
         self._channels_last = (not _is_vit(cfg.backbone)) if cfg.channels_last is None \
             else bool(cfg.channels_last)
+        if getattr(cfg, "block_ckpt", False):
+            if cfg.grad_ckpt:
+                raise ValueError("block_ckpt (timm per-block checkpointing) and grad_ckpt (per-chunk "
+                                 "checkpointing) are mutually exclusive — pick one")
+            if not hasattr(self.backbone, "set_grad_checkpointing"):
+                raise ValueError(f"block_ckpt: backbone {cfg.backbone!r} has no "
+                                 f"set_grad_checkpointing()")
+        self._block_ckpt_on: Optional[bool] = None   # last state pushed into timm (block_ckpt only)
 
     # ---- plumbing --------------------------------------------------------------------
     def data_config(self):
@@ -259,6 +276,15 @@ class StudyModelV2(nn.Module):
             flat = flat.to(memory_format=torch.channels_last)
         chunk = int(self.cfg.slice_chunk) or (b * k)
         use_ckpt = bool(self.cfg.grad_ckpt) and self.training and torch.is_grad_enabled()
+        if getattr(self.cfg, "block_ckpt", False):
+            # timm per-block recompute, ON only for a training forward with grad enabled. timm's
+            # stages consult the flag on every forward, so it is (re)set here rather than once at
+            # build time: an eval pass, `torch.no_grad()` inference and the fingerprint then run the
+            # plain blocks. With the flag off this branch is never entered.
+            want = bool(self.training and torch.is_grad_enabled())
+            if want is not self._block_ckpt_on:
+                self.backbone.set_grad_checkpointing(want)
+                self._block_ckpt_on = want
         outs: List[torch.Tensor] = []
         for i in range(0, b * k, chunk):
             sub = flat[i:i + chunk]
@@ -324,7 +350,9 @@ def build_model_v2(cfg: Optional[ModelV2Config] = None, verbose: bool = True, **
               f"params: backbone={p['backbone'] / 1e6:.1f}M head={p['head'] / 1e6:.2f}M "
               f"total={p['total'] / 1e6:.1f}M | channels_last={model._channels_last} "
               f"grad_ckpt={cfg.grad_ckpt} slice_chunk={cfg.slice_chunk or 'all'} "
-              f"learn_slot_bias={cfg.learn_slot_bias}", flush=True)
+              f"learn_slot_bias={cfg.learn_slot_bias}"
+              + (" block_ckpt=True (timm per-block, training only)" if cfg.block_ckpt else ""),
+              flush=True)
     return model
 
 

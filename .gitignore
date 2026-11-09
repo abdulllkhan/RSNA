@@ -1,35 +1,74 @@
 # secrets
 .env
 *.key
+*.pem
 kaggle.json
-# heavy / generated
+.kaggle/
+
+# local-only working notes and assistant settings (not part of the public repo)
+/PLAN.md
+/EXPERIMENTS.md
+/HANDOFF.md
+/reports/
+.claude/
+
+# competition data, weights, caches (heavy / generated; the competition data is not redistributable)
 data/
 models/
 checkpoints/
+*.dcm
 *.zip
 *.ckpt
 *.pt
 *.pth
+*.slim.pt
+*.safetensors
+*.onnx
 *.npy
 *.npz
+*.pkl
+*.parquet
+*.csv
+oof/
+wandb/
+
+# python / tooling
 .venv/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-wandb/
-*.slim.pt
-*.pkl
-*.parquet
-*.csv
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
 
 # generated notebook artefacts (rebuild with notebook/build_notebook*.py)
 notebook/submission*.ipynb
 notebook/submission_standalone.py
 notebook/submission_multi_standalone.py
 
-# scratch / staging
+# run state written by the submit scripts, logs, scratch / staging
+dev/kaggle/last_kernel_version
+dev/kaggle/last_multi_kernel_version
+dev/kaggle/last_submit_msg
 dev/kaggle/weights_pkg/
 logs/
 *.log
+*.out
 outputs/
-oof/
+
+# LaTeX build files (the compiled paper PDF is tracked)
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.xdv
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

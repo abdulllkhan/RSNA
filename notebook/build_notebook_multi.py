@@ -91,6 +91,21 @@ Env / config (all optional; the Kaggle defaults are the fallbacks):
                       Global ("3") or per arm ("base:3,hr:2"); a bare number sets the default
                       for every arm and `arm:S` overrides one. base + hr + v2 only (see below).
     RSNA_TTA_COMBINE  rank|prob, across-variant combiner (default rank)
+    RSNA_BATCH_READER / RSNA_WORKERS_READER   reader arm batch (default 4 = the released infer.py) / loader
+                      workers (default RSNA_WORKERS if set, else 4 = the released infer.py)
+    RSNA_READER_DEADLINE_H   the reader arm aborts (and is dropped) once the driver has run this long (default 8.0)
+    RSNA_DUMP_ARMS    local tests only: pickle every finished arm frame into this directory
+
+The `reader` arm (src/rsna/reader_gpjw.py; EXPERIMENTS A18): goodpjw2008's public 2.5D ConvNeXt-T reader, its 3
+checkpoints read from the attached public dataset goodpjw2008/rsna-knee-2-5d-convnext-reader. It is OPT-IN (weight
+0 unless RSNA_ARM_WEIGHTS names it, so an older weights string runs exactly as before), runs LAST, is pinned to S=1,
+and is inlined in its own module namespace (its names collide with the other arms'). Its frame may lack single
+studies (0 valid slots / a failed forward): those rows average the other arms with renormalised weights
+(combine_partial.py); its pre-registered guard drops the whole arm on > 2 % invalid studies or > 2 % series with
+decode errors. Before it runs, the other arms' submission is already written to RSNA_OUT (crash fallback).
+
+Build-time switch: RSNA_BUNDLE_PKG=<dir> reads the inlined modules from <dir> instead of src/rsna (used to build
+the sub #13 bundle from git-HEAD copies of the pre-existing modules while src/rsna carries unrelated edits).
 
 Run:  .venv/bin/python notebook/build_notebook_multi.py
 """
@@ -103,7 +118,8 @@ import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
-PKG = os.path.join(ROOT, "src", "rsna")
+# Optional build-time switch: inline the modules from another package dir (default: src/rsna, unchanged).
+PKG = os.path.abspath(os.environ.get("RSNA_BUNDLE_PKG") or os.path.join(ROOT, "src", "rsna"))
 
 # Dependency order. decode.py, order.py and laterality.py are import-free (lazy pydicom);
 # dataset_hr needs dataset+decode; tta needs dataset+dataset_hr; dataset_25d / dataset_ordered
@@ -138,7 +154,17 @@ MODULES = [
     "infer_plane.py",
     "infer_v2.py",         # reuses _forward_with_guard from infer_hr; needs model_v2
     "infer_tta.py",        # wraps infer.predict_studies + infer_hr.predict_studies_hr
+    "combine_partial.py",  # per-row fallback around infer_plane.rank_average_frames (the reader arm)
+    "reader_gpjw.py",      # ISOLATED (see ISOLATED_MODULES): the public 2.5D reader, module `reader_gpjw`
 ]
+
+# Modules executed in their OWN namespace instead of being flattened into the bundle. reader_gpjw.py is the
+# verbatim port of a third-party reader whose module-level names (N_SLOTS=6, SIZE, MEAN, STD, PLANES, LABELS,
+# load_series, make_views, ...) collide with -- and would silently rebind -- names the other arms read at call
+# time (dataset_v2.N_SLOTS=5, ...). Renaming them would break the port's AST identity with the author's code, so
+# the file is embedded verbatim as a string and exec'd into a fresh module object; the driver calls it as
+# `reader_gpjw.<name>`.
+ISOLATED_MODULES = {"reader_gpjw.py": "reader_gpjw"}
 
 # ---------------------------------------------------------------------------------------
 # Per-module identifier renames applied while inlining.
@@ -285,12 +311,42 @@ except NameError:
 '''
 
 
+ISOLATED_TEMPLATE = '''import linecache as _linecache
+import sys as _sys
+import types as _types
+{var} = r\'\'\'{src}\'\'\'
+{mod} = _types.ModuleType("{mod}")
+{mod}.__file__ = "{mod}.py"
+_linecache.cache["{mod}.py"] = (len({var}), None, {var}.splitlines(True), "{mod}.py")  # readable tracebacks
+_sys.modules["{mod}"] = {mod}
+exec(compile({var}, "{mod}.py", "exec", dont_inherit=True), {mod}.__dict__)'''
+
+
+def isolated_block(src: str, mod: str) -> str:
+    """The bundle text that runs `src` VERBATIM as module `mod` (own globals, no __future__ inheritance).
+    The source travels as a raw triple-quoted literal; the build fails unless that literal round-trips exactly."""
+    if "'''" in src or src.endswith("\\"):
+        raise RuntimeError(f"{mod}: source cannot be embedded as a r'''...''' literal")
+    if ast.literal_eval("r'''" + src + "'''") != src:
+        raise RuntimeError(f"{mod}: embedded literal does not round-trip")
+    return ISOLATED_TEMPLATE.format(var="_SRC_" + mod.upper(), mod=mod, src=src)
+
+
 def build_bundle() -> str:
     parts = ["from __future__ import annotations", "", FILE_SHIM]
     bodies = {}
     for m in MODULES:
         with open(os.path.join(PKG, m)) as f:
-            body = _strip_module(_apply_renames(f.read(), m))
+            raw = f.read()
+        if m in ISOLATED_MODULES:
+            body = isolated_block(raw, ISOLATED_MODULES[m])
+            bodies[m] = body
+            parts.append(f"# ===================== isolated: src/rsna/{m} -> module "
+                         f"`{ISOLATED_MODULES[m]}` (own namespace) =====================")
+            parts.append(body)
+            parts.append("")
+            continue
+        body = _strip_module(_apply_renames(raw, m))
         bodies[m] = body
         parts.append(f"# ===================== inlined: src/rsna/{m} =====================")
         parts.append(body)
@@ -339,7 +395,15 @@ BATCH = int(os.environ.get("RSNA_BATCH", "8"))
 WEIGHTS_DIR = os.environ.get("RSNA_WEIGHTS_DIR", "/kaggle/input")
 MEMBER_MODE = os.environ.get("RSNA_MEMBER_MODE", "prob").strip().lower()  # within-arm combiner
 
-ARM_ORDER = ("base", "hr", "25d", "ordered", "v2", "plane")
+ARM_ORDER = ("base", "hr", "25d", "ordered", "v2", "plane", "reader")
+# OPT-IN arms keep weight 0 unless RSNA_ARM_WEIGHTS names them, so a weights string written before they existed
+# runs exactly as it did. `reader` = goodpjw2008's public 2.5D ConvNeXt-T reader (module `reader_gpjw`); it is
+# last in ARM_ORDER, so it runs after every other arm.
+OPT_IN_ARMS = ("reader",)
+# Arms whose frame may lack single studies: those rows average the other arms only, weights renormalised
+# (rank_average_frames_partial). Every other arm covers every study or fails as a whole, as before.
+ROW_OPTIONAL_ARMS = ("reader",)
+DUMP_ARMS = os.environ.get("RSNA_DUMP_ARMS")  # local tests only: pickle each finished arm frame there
 
 # Arms with a slot-sampling TTA wrapper (reports/tta_tooling.md §7, reports/tta_v2.md).
 # `base`/`hr` go through `tta.dataset_factory`; `v2` does NOT -- it needs none, because its
@@ -353,8 +417,9 @@ TTA_CAPABLE = ("base", "hr", "v2")
 
 
 def parse_arm_weights(spec, default=1.0):
-    """"base=1,hr=1,plane=0.5" -> {"base":1.0,"hr":1.0,"plane":0.5}; unnamed arms keep `default`."""
-    w = {a: float(default) for a in ARM_ORDER}
+    """"base=1,hr=1,plane=0.5" -> {"base":1.0,"hr":1.0,"plane":0.5}; unnamed arms keep `default`, except the
+    OPT-IN arms (`reader`), which stay at 0 unless named."""
+    w = {a: (0.0 if a in OPT_IN_ARMS else float(default)) for a in ARM_ORDER}
     for tok in str(spec or "").replace(";", ",").split(","):
         tok = tok.strip()
         if not tok:
@@ -604,11 +669,30 @@ def run_arm(arm, paths, root, device, study_ids):
     size = 224
     members = None
     S = int(TTA_S.get(arm, 1))
-    print(f"[tta] arm={arm} S={S}" + ("" if S > 1 else
-          (" (baseline sampling, TTA off)" if arm in TTA_CAPABLE else
-           " (no TTA wrapper for this arm)")))
+    if arm == "reader":
+        print("[tta] arm=reader S=1 (pinned: the validated reader configuration is ONE k=12 pass; "
+              "RSNA_TTA does not apply to it)")
+    else:
+        print(f"[tta] arm={arm} S={S}" + ("" if S > 1 else
+              (" (baseline sampling, TTA off)" if arm in TTA_CAPABLE else
+               " (no TTA wrapper for this arm)")))
     try:
         _t = time.time()
+        if arm == "reader":
+            # goodpjw2008's public reader (module `reader_gpjw`): 3 checkpoints (name/args/sha256-checked, strict
+            # weights_only=True load), k=12, fp16 autocast, probability mean, S=1 -- the validated configuration.
+            # It returns a frame of the VALID studies only; its guard verdict decides whether the arm is kept.
+            b = max(1, int(os.environ.get("RSNA_BATCH_READER", "4")))  # the released infer.py: bs=4
+            nw = int(os.environ.get("RSNA_WORKERS_READER") or os.environ.get("RSNA_WORKERS") or 4)
+            deadline = _T_START + float(os.environ.get("RSNA_READER_DEADLINE_H", "8.0")) * 3600.0
+            res = reader_gpjw.predict_reader(paths, root, "test", study_ids, device=device, batch=b,
+                                             workers=nw, deadline=deadline)
+            try:
+                reader_gpjw.write_reader_outputs(res, os.path.dirname(os.path.abspath(OUT)))
+            except Exception as e:
+                print(f"[reader] diagnostics not written ({type(e).__name__}: {e})")
+            _stage("predict[reader]", _t)
+            return res["frame"] if res["guard_ok"] else None
         if arm == "base":
             members = load_members(paths, device=device)
             size = 224
@@ -705,9 +789,15 @@ def run_arm(arm, paths, root, device, study_ids):
             # DICOM, so slice order comes from `order.series_ranks_from_dicom` and laterality
             # from `laterality.side_from_series_meta` over the headers the decode already read
             # -- neither data/series_order.parquet nor data/study_side.parquet is shipped.
-            # Members of several `size` values share ONE 384 decode per study and differ only
-            # by the INTER_AREA resize in `_stack_to_tensor` (they are grouped by
-            # MemberV2.signature = (size, mean, std)), so a 384 + 336 mix costs one decode.
+            # Members are grouped first by DECODE GROUP `(crop_mm, pct)` -- one decode per
+            # group per study, at `decode_size = max(CACHE_SIZE, max member size)` of that
+            # group -- and inside a group by MemberV2.signature = (size, mean, std), which
+            # differ only by the INTER_AREA resize in `_stack_to_tensor`. So a 384 + 336 mix
+            # at one crop still costs ONE decode, while a 110 mm + 140 mm mix costs TWO (the
+            # `[predict] ... decode groups: [(crop_mm, decode_size, n_members)]` banner says
+            # how many, and `[time] stage=v2_decode[c<crop>@<size>]` says what each cost).
+            # Before 2026-09-20 a crop mix was decoded ONCE with member 0's crop_mm, which is
+            # how the c110 models were fed 140 mm crops -- reports/crop_fix.md.
             # `tta=S` shares that same decode across the S slot-phase variants too, so S
             # multiplies the v2 FORWARD only -- `[time] stage=v2_decode` stays flat while
             # `stage=v2_forward` scales with S (reports/tta_v2.md). S=1 is the literal
@@ -752,6 +842,46 @@ def run_arm(arm, paths, root, device, study_ids):
                 pass
 
 
+def combine_frames(frames, used_arms, tag=""):
+    """The across-arm combiner -> (preds, used_arms). Without a ROW_OPTIONAL arm this is the pre-reader code
+    path statement for statement (rank_average_frames over the inner join; missing studies -> 0.5 via reindex).
+    A ROW_OPTIONAL arm (the reader) may lack single studies: the join is taken over the OTHER arms, and a study
+    the reader lacks averages the other arms only, weights renormalised (rank_average_frames_partial, which
+    returns rank_average_frames itself when the reader covers every study)."""
+    w = [ARM_WEIGHTS[a] for a in used_arms]
+    print(f"[combine] {tag}per-column rank average over arms {used_arms} with weights {w}")
+    opt = [a in ROW_OPTIONAL_ARMS for a in used_arms]
+    if all(opt):  # only the reader survived: nothing to fall back to, plain average
+        opt = [False] * len(opt)
+    req = [i for i, o in enumerate(opt) if not o]
+    if len(req) > 1:
+        rf, ra = [frames[i] for i in req], [used_arms[i] for i in req]
+        counts = [len(f) for f in rf]
+        common = set(rf[0][ID_COL].astype(str))
+        for f in rf[1:]:
+            common &= set(f[ID_COL].astype(str))
+        print(f"[combine] {tag}arm row counts {dict(zip(ra, counts))}; common studies {len(common)}")
+        if len(common) < max(counts):
+            print(f"[combine] WARNING: {max(counts) - len(common)} study(ies) missing from at "
+                  f"least one arm; they fall back to 0.5 via reindex")
+        if not common:  # never ship an empty ensemble: keep the widest single arm instead
+            best = req[int(np.argmax(counts))]
+            print(f"[combine] EMPTY intersection -> falling back to arm {used_arms[best]} alone")
+            frames, used_arms, w, opt = [frames[best]], [used_arms[best]], [ARM_WEIGHTS[used_arms[best]]], [False]
+    if not any(opt):
+        return rank_average_frames(frames, weights=w), used_arms
+    ids_req = set(frames[req[0]][ID_COL].astype(str))
+    for i in req[1:]:
+        ids_req &= set(frames[i][ID_COL].astype(str))
+    for i, o in enumerate(opt):
+        if o:
+            n_have = len(ids_req & set(frames[i][ID_COL].astype(str)))
+            print(f"[combine] {tag}arm {used_arms[i]} covers {n_have}/{len(ids_req)} studies"
+                  + ("" if n_have == len(ids_req) else
+                     f"; {len(ids_req) - n_have} fall back to the other arms (weights renormalised)"))
+    return rank_average_frames_partial(frames, w, opt, log=None), used_arms
+
+
 def _fallback_test_df():
     root = find_data_root("/kaggle/input") or os.environ.get("RSNA_INPUT_ROOT")
     for cand in [root, "/kaggle/input/rsna-knee-abnormality-detection",
@@ -774,7 +904,22 @@ try:
     _stage("mount_discovery", _t)
 
     weights = find_weights(WEIGHTS_DIR)  # prints its own [time] stage=weights_search line
-    if not weights:
+    # The reader's checkpoints live in their own public dataset. Keep them OUT of the generic detection (its peek
+    # uses the full unpickler and would route them to `base`) and find them with the reader's own shallow search,
+    # which knows both mount layouts (<root>/<slug> and <root>/datasets/<owner>/<slug>).
+    reader_paths = [p for p in weights if reader_gpjw.is_reader_file(p)]
+    weights = [p for p in weights if not reader_gpjw.is_reader_file(p)]
+    try:  # a failure here may cost the reader, never the other arms
+        reader_paths += reader_gpjw.find_reader_checkpoints((WEIGHTS_DIR, "/kaggle/input"))
+        _by_name = {}
+        for _p in sorted(reader_paths):  # one path per file name (the same file can be reached twice)
+            _by_name.setdefault(os.path.basename(_p), _p)
+        reader_paths = [_by_name[_k] for _k in sorted(_by_name)]
+    except Exception:
+        print("[weights] reader checkpoint search FAILED -> no reader members:")
+        traceback.print_exc()
+        reader_paths = []
+    if not weights and not reader_paths:
         raise FileNotFoundError(f"no checkpoints under {WEIGHTS_DIR}")
     print(f"[weights] {len(weights)} checkpoint(s) under {WEIGHTS_DIR}")
 
@@ -788,6 +933,16 @@ try:
             continue
         by_arm[arm].append(cp)
         print(f"[weights] {os.path.basename(cp):46s} -> arm={arm:7s} size={size:4d} {kdesc}")
+    for cp in sorted(reader_paths, key=os.path.basename):
+        try:  # member = file name cnxt_v0_fold<k>.pt AND args (name, backbone, res, k_eval, fold), weights_only
+            fold = reader_gpjw.check_reader_args(cp, reader_gpjw.reader_ckpt_args(cp))
+        except Exception as e:
+            print(f"[weights] SKIP {os.path.basename(cp)}: not the validated reader ({type(e).__name__}: {e})")
+            continue
+        by_arm["reader"].append(cp)
+        print(f"[weights] {os.path.basename(cp):46s} -> arm={'reader':7s} size={reader_gpjw.READER_RES:4d} "
+              f"k={reader_gpjw.READER_K} fold={fold} {reader_gpjw.READER_NAME} {reader_gpjw.READER_BACKBONE} "
+              f"({os.path.dirname(cp)})")
     _stage("arm_detect", _t)
 
     plan = []
@@ -812,6 +967,19 @@ try:
     study_ids = test_df[ID_COL].astype(str).tolist()
     frames, used_arms = [], []
     for arm in plan:
+        if arm in ROW_OPTIONAL_ARMS and frames:
+            # Crash fallback, written BEFORE the reader runs: the other arms' finished submission goes to OUT now,
+            # so a hard crash / kill inside the reader leaves exactly that file instead of the 0.5 benchmark.
+            # (Python-level reader failures are caught below and drop only the reader, like any arm.)
+            try:
+                p0, a0 = combine_frames(frames, used_arms, tag="pre-reader ")
+                write_submission(p0, test_df, OUT)
+                write_submission(p0, test_df, os.path.join(os.path.dirname(os.path.abspath(OUT)),
+                                                           "submission_pre_reader.csv"))
+                print(f"[driver] pre-reader submission written (arms {a0}): OUT holds it if the reader dies")
+            except Exception:
+                print("[driver] pre-reader submission FAILED (continuing):")
+                traceback.print_exc()
         _t = time.time()
         try:
             f = run_arm(arm, by_arm[arm], root, device, study_ids)
@@ -822,31 +990,22 @@ try:
             continue
         _stage(f"arm[{arm}]", _t)
         if f is None or len(f) == 0:
+            if arm in ROW_OPTIONAL_ARMS:
+                print(f"[arm {arm}] dropped (guard tripped or no valid study) -> the ensemble is the other arms")
+                continue
             print(f"[arm {arm}] produced 0 rows -> dropped from the ensemble")
             continue
         frames.append(f)
         used_arms.append(arm)
         print(f"[arm {arm}] OK: {len(f)} studies")
+        if DUMP_ARMS:
+            os.makedirs(DUMP_ARMS, exist_ok=True)
+            f.to_pickle(os.path.join(DUMP_ARMS, f"arm_{arm}.pkl"))
     if not frames:
         raise RuntimeError("every arm failed")
 
-    w = [ARM_WEIGHTS[a] for a in used_arms]
-    print(f"[combine] per-column rank average over arms {used_arms} with weights {w}")
-    if len(frames) > 1:
-        counts = [len(f) for f in frames]
-        common = set(frames[0][ID_COL].astype(str))
-        for f in frames[1:]:
-            common &= set(f[ID_COL].astype(str))
-        print(f"[combine] arm row counts {dict(zip(used_arms, counts))}; common studies {len(common)}")
-        if len(common) < max(counts):
-            print(f"[combine] WARNING: {max(counts) - len(common)} study(ies) missing from at "
-                  f"least one arm; they fall back to 0.5 via reindex")
-        if not common:  # never ship an empty ensemble: keep the widest single arm instead
-            best = int(np.argmax(counts))
-            print(f"[combine] EMPTY intersection -> falling back to arm {used_arms[best]} alone")
-            frames, used_arms, w = [frames[best]], [used_arms[best]], [ARM_WEIGHTS[used_arms[best]]]
     _t = time.time()
-    preds = rank_average_frames(frames, weights=w)
+    preds, used_arms = combine_frames(frames, used_arms)
 
     sub = write_submission(preds, test_df, OUT)  # pct-rank + reindex to test.csv + fillna(0.5)
     _stage("combine_write", _t)
@@ -887,7 +1046,10 @@ def make_notebook(bundle: str, driver: str) -> dict:
            "`decode` / `order` / `laterality` / `dataset` / `dataset_hr` / `tta` /\n"
            "`dataset_25d` / `dataset_ordered` / `dataset_plane` / `dataset_v2` / `model` /\n"
            "`model_plane` / `model_v2` / `infer` / `infer_hr` / `infer_25d` /\n"
-           "`infer_ordered` / `infer_plane` / `infer_v2` / `infer_tta`.\n"
+           "`infer_ordered` / `infer_plane` / `infer_v2` / `infer_tta` / `combine_partial`, plus\n"
+           "`reader_gpjw` in its own namespace: goodpjw2008's public 2.5D ConvNeXt-T reader\n"
+           "(Apache-2.0; weights from the attached dataset goodpjw2008/rsna-knee-2-5d-convnext-reader),\n"
+           "the opt-in `reader` arm.\n"
            "\n"
            "Every checkpoint in the attached weights dataset is loaded; its ARM is detected\n"
            "from its own `args`/`cfg` (base 224 / hr 384+ / 2.5D / ordered-sampler / v2 slot\n"
@@ -922,6 +1084,7 @@ def make_notebook(bundle: str, driver: str) -> dict:
 
 
 def main():
+    print(f"bundle modules from {PKG}")
     bundle = build_bundle()
     compile(bundle + "\n\n" + DRIVER.lstrip("\n"), "<submission_multi>", "exec")  # syntax gate
     nb = make_notebook(bundle, DRIVER)

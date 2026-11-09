@@ -30,11 +30,21 @@ THE DICOM PATH, PER STUDY (the ordering of these steps is load-bearing)
     filename, which is a randomised InstanceUID (lex == anatomical in 0/400 series);
  5. side from `laterality.side_from_series_meta` over the metas of everything decoded;
  6. `plan_slots` -> the same picks the trainer would have made;
- 7. one uint8 [K,384,384] canonical stack per study -> resized per member `size` -> normalised
-    per member (mean,std) -> forwarded through every member of that size group.
+ 7. one uint8 [K,D,D] canonical stack per study (D = the group's `decode_size`) -> resized
+    per member `size` -> normalised per member (mean,std) -> forwarded through every member
+    of that size group.
 
-Members of different `size` share the 384 decode and differ only by an INTER_AREA resize,
-which is exactly what `dataset_v2` does when trained at `--size 336` off the 384 cache.
+DECODE GROUPS (2026-09-20). Steps 3-5 depend on the RENDERING contract `(crop_mm, pct)`, so
+members are partitioned by that pair: one decode per (crop_mm, pct) per study, at
+`decode_size = max(CACHE_SIZE, max member size)` of the group. Two 110 mm members and five
+140 mm members therefore cost two decodes, not one silently-wrong decode — before this the
+predictor decoded everything with member 0's crop and only printed a WARNING, which is how
+`v2_effv2s384_c110_*` (whose `args['crop_mm']` said 140) got fed 140 mm crops on Kaggle.
+
+Members of different `size` inside one decode group share that group's decode and differ only
+by an INTER_AREA resize, which is exactly what `dataset_v2` does when trained at `--size 336`
+off the 384 cache. The floor at `CACHE_SIZE` is deliberate: a sub-384 member was trained on a
+384 cache, so it must keep seeing 384 -> its size, not a direct decode at its own size.
 
 SLOT-PHASE TTA (`tta=S`, reports/tta_v2.md)
 -------------------------------------------
@@ -90,8 +100,10 @@ from .dataset_v2 import (
     SeriesRecV2,
     StudyBagDatasetV2,
     build_index_v2,
+    context_ranks,
     fallback_report,
     load_side_map,
+    parse_cache_contract,
     plan_slots,
     select_slot_series,
     variant_index_of,
@@ -143,7 +155,8 @@ class MemberV2:
     def __init__(self, model, mean, std, size: int, fingerprint, name: str = "",
                  k_eval: int = K_FULL, k_scale: float = 1.0,
                  slot_prior: float = 0.55, crop_mm: float = V2_CROP_MM,
-                 pct: Sequence[float] = V2_PCT, backbone: str = ""):
+                 pct: Sequence[float] = V2_PCT, backbone: str = "",
+                 slice_context: int = 0):
         self.model = model
         self.mean = np.asarray(mean, dtype=np.float32).reshape(3, 1, 1)
         self.std = np.asarray(std, dtype=np.float32).reshape(3, 1, 1)
@@ -156,13 +169,38 @@ class MemberV2:
         self.crop_mm = float(crop_mm)
         self.pct = tuple(float(v) for v in pct)
         self.backbone = backbone
+        # 2.5D slot context (`train_v2 --slice-context`). 0 = replicated grayscale, 1 =
+        # [prev, this, next]. A checkpoint trained before the flag existed has no such key, so
+        # the default reproduces the original tensor exactly.
+        self.slice_context = int(slice_context)
 
     @property
     def signature(self) -> Tuple:
-        """Members sharing this share ONE normalised tensor (decode is shared by all)."""
+        """Members sharing this share ONE normalised tensor (inside one decode group).
+
+        `slice_context` is part of it: two members can share a decode and even a `size` and
+        still need different CHANNELS, which is a different float tensor (and, on the cache
+        path, a different `StudyBagDatasetV2`). `size` stays first — the group banners print
+        `sig[0]`.
+        """
         return (self.size,
                 tuple(np.asarray(self.mean).ravel().round(6).tolist()),
-                tuple(np.asarray(self.std).ravel().round(6).tolist()))
+                tuple(np.asarray(self.std).ravel().round(6).tolist()),
+                self.slice_context)
+
+    @property
+    def decode_key(self) -> Tuple:
+        """Members sharing this share ONE per-study DICOM decode: same crop, same percentiles.
+
+        `size` is deliberately NOT part of it — a bigger sibling's decode can be resized down
+        by `_stack_to_tensor`, but a different `crop_mm` or `pct` is a different image.
+        `slice_context` is NOT part of it either: the neighbours of a slot slice are other
+        slices of the SAME decoded volume, so a context member and a context-0 member share one
+        decode and one assembled stack (built at the group's max context, `context_for`); the
+        context-0 member then reads its centre plane, byte for byte what it saw before.
+        """
+        return (round(float(self.crop_mm), 6),
+                tuple(round(float(p), 6) for p in self.pct))
 
     def __repr__(self) -> str:
         return f"MemberV2({self.name or 'ckpt'}, size={self.size}, K={self.k_eval})"
@@ -195,12 +233,43 @@ def load_members_v2(checkpoint_paths: Sequence[str], device: str = "cuda",
                      k_eval=int(a.get("k_eval", K_FULL)), k_scale=float(a.get("k_scale", 1.0)),
                      slot_prior=float(a.get("slot_prior", cfg.slot_prior)),
                      crop_mm=float(a.get("crop_mm", V2_CROP_MM)),
-                     pct=tuple(a.get("pct", V2_PCT)), backbone=cfg.backbone)
+                     pct=tuple(a.get("pct", V2_PCT)), backbone=cfg.backbone,
+                     slice_context=int(a.get("slice_context", 0) or 0))
         print(f"[member] {m.name}: mode=v2 size={m.size} K_eval={m.k_eval} "
               f"(trained k_scale={m.k_scale}) crop_mm={m.crop_mm} pct={m.pct} "
-              f"slot_prior={m.slot_prior} backbone={m.backbone}")
+              f"slot_prior={m.slot_prior} slice_context={m.slice_context} "
+              f"backbone={m.backbone}")
         members.append(m)
     return members
+
+
+def decode_groups_v2(members: Sequence[MemberV2]) -> Dict[Tuple, List[int]]:
+    """`{(crop_mm, pct): [member index, ...]}` — one per-study decode per returned key."""
+    out: Dict[Tuple, List[int]] = {}
+    for i, m in enumerate(members):
+        out.setdefault(m.decode_key, []).append(i)
+    return out
+
+
+def decode_size_for(members: Sequence[MemberV2], idxs: Sequence[int]) -> int:
+    """Pixels to decode a group at: the largest member size, floored at `CACHE_SIZE`.
+
+    Floored because a member smaller than the cache (e.g. `--size 336` off the 384 cache) was
+    TRAINED on `CACHE_SIZE -> its size` INTER_AREA, and decoding straight to 336 would hand it
+    an image its training distribution never contained. Above the floor the group's biggest
+    member gets a native decode and its smaller siblings get the same INTER_AREA down-resize
+    the cache path gives them.
+    """
+    return max(int(CACHE_SIZE), max(int(members[i].size) for i in idxs))
+
+
+def context_for(members: Sequence[MemberV2], idxs: Sequence[int]) -> int:
+    """Neighbour planes the group's SHARED stack must carry: the largest member context.
+
+    A context-0 member reads the centre plane of that stack and gets exactly the pixels a
+    1-plane stack would have handed it, so one assemble serves the whole decode group.
+    """
+    return max(int(members[i].slice_context) for i in idxs)
 
 
 def check_fingerprint_v2(member: MemberV2, device: str, tol: float = FINGERPRINT_TOL) -> bool:
@@ -290,6 +359,9 @@ def decode_study_series(
     pct: Sequence[float] = V2_PCT,
     verbose: bool = False,
     timers: Optional[Dict[str, float]] = None,
+    size: int = CACHE_SIZE,
+    timer_tag: Optional[str] = None,
+    plan_cache: Optional[Dict] = None,
 ) -> Tuple[List, Dict[str, np.ndarray], Dict[str, np.ndarray], str, str]:
     """Steps 1-5 -> `(sels, vols, anat, side, source)`. THE EXPENSIVE HALF, run ONCE per study.
 
@@ -303,13 +375,24 @@ def decode_study_series(
 
     `series_rows` is `group_series_rows(<split>_series.csv)` (or the raw DataFrame, which is
     grouped on the spot — pass the dict in a loop).
+
+    `size` is the decode edge (`decode_size_for` of the calling group). `plan_cache` is a
+    per-STUDY scratch dict: when several decode groups decode the same study, the slot plan and
+    the header-derived slice order do not depend on `(crop_mm, pct, size)`, so the second and
+    later groups reuse them and pay only for pixels. Passing `plan_cache=None` (the default)
+    reproduces the original single-decode code path exactly.
     """
     from .decode import read_series_v2  # lazy: the cache path must not need pydicom
 
     t = time.time()
-    recs = _study_series_records(root, split, series_rows, study)
-    sels = select_slot_series(recs, k_scale=1.0, train=False)          # eval = full 64
-    need = {s.rec.series: s.rec for s in sels if s.rec is not None}
+    if plan_cache is not None and "sels" in plan_cache:
+        sels, need = plan_cache["sels"], plan_cache["need"]
+    else:
+        recs = _study_series_records(root, split, series_rows, study)
+        sels = select_slot_series(recs, k_scale=1.0, train=False)      # eval = full 64
+        need = {s.rec.series: s.rec for s in sels if s.rec is not None}
+        if plan_cache is not None:
+            plan_cache["sels"], plan_cache["need"] = sels, need
     if timers is not None:
         timers["plan"] = timers.get("plan", 0.0) + (time.time() - t)
 
@@ -317,18 +400,29 @@ def decode_study_series(
     vols: Dict[str, np.ndarray] = {}
     anat: Dict[str, np.ndarray] = {}
     metas_all: List[List[dict]] = []
+    rank_cache = None if plan_cache is None else plan_cache.setdefault("anat", {})
     for uid, rec in need.items():
         paths = list(rec.paths)
-        ranks, _method = series_ranks_from_dicom(paths)
-        vol, metas = read_series_v2(paths, size=CACHE_SIZE, crop_mm=float(crop_mm),
+        if rank_cache is not None and uid in rank_cache:
+            order = rank_cache[uid]
+        else:
+            ranks, _method = series_ranks_from_dicom(paths)
+            # anat[r] = index into `paths` (and into `vol`, which read_series_v2 aligns to paths)
+            order = np.argsort(np.asarray(ranks), kind="stable").astype(np.int64)
+            if rank_cache is not None:
+                rank_cache[uid] = order
+        vol, metas = read_series_v2(paths, size=int(size), crop_mm=float(crop_mm),
                                     pct=tuple(pct), verbose=verbose)
         vols[uid] = np.asarray(vol)
-        # anat[r] = index into `paths` (and into `vol`, which read_series_v2 aligns to paths)
-        anat[uid] = np.argsort(np.asarray(ranks), kind="stable").astype(np.int64)
+        anat[uid] = order
         if metas:
             metas_all.append(list(metas))
     if timers is not None:
-        timers["decode"] = timers.get("decode", 0.0) + (time.time() - t)
+        dt = time.time() - t
+        timers["decode"] = timers.get("decode", 0.0) + dt
+        if timer_tag:
+            key = f"decode[{timer_tag}]"
+            timers[key] = timers.get(key, 0.0) + dt
 
     side, source, _x = _side_from_metas(metas_all) if metas_all else (CANONICAL_SIDE, "no-meta", 0.0)
     return sels, vols, anat, side, source
@@ -341,17 +435,35 @@ def assemble_stack(
     side: str = CANONICAL_SIDE,
     phase: float = 0.0,
     timers: Optional[Dict[str, float]] = None,
+    size: Optional[int] = None,
+    context: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Steps 6-7 for ONE slot phase -> `(stack uint8 [K,384,384], slot_id, pos, valid)`.
+    """Steps 6-7 for ONE slot phase -> `(stack uint8 [K,D,D], slot_id, pos, valid)`.
 
     Pure indexing + an optional horizontal flip over volumes `decode_study_series` already
     produced: no pixels are re-read and nothing is re-decoded, which is what makes S-variant
     TTA cost S x forward rather than S x everything. `phase=0.0` is the baseline plan.
+
+    `size` (D) defaults to the edge of the volumes themselves — `CACHE_SIZE` when `vols` is
+    empty — so a group decoded at 512 assembles a [K,512,512] stack without the caller having
+    to repeat itself.
+
+    `context=N` (2.5D slot context) widens the stack to `[K, 2N+1, D, D]`: plane `c` of bag
+    position `j` is the slice `(c - N) * step` slices away from the picked one in the series'
+    ANATOMICAL order, clamped at the ends — `dataset_v2.context_ranks`, the SAME function the
+    training dataset calls on its JPEG cache, walking the SAME `SlotPick.step` (so a left
+    knee's reversed sagittal neighbourhood runs the same way in both paths). `context=0`
+    returns the original 3-D `[K,D,D]` stack, bit for bit: nothing below it is touched.
     """
     t = time.time()
     picks = plan_slots(sels, side=side, train=False, phase=phase)
     k = len(picks)
-    stack = np.zeros((k, CACHE_SIZE, CACHE_SIZE), dtype=np.uint8)
+    if size is None:
+        size = int(next(iter(vols.values())).shape[-1]) if vols else int(CACHE_SIZE)
+    size = int(size)
+    ctx = int(context)
+    stack = (np.zeros((k, size, size), dtype=np.uint8) if ctx <= 0
+             else np.zeros((k, 2 * ctx + 1, size, size), dtype=np.uint8))
     slot_id = np.zeros(k, dtype=np.int64)
     pos = np.zeros(k, dtype=np.float32)
     valid = np.zeros(k, dtype=bool)
@@ -364,13 +476,27 @@ def assemble_stack(
         order = anat.get(p.series)
         if vol is None or order is None or len(vol) == 0:
             continue
-        src = int(order[min(p.idx, len(order) - 1)])
-        if src >= len(vol):
+        if ctx <= 0:
+            src = int(order[min(p.idx, len(order) - 1)])
+            if src >= len(vol):
+                continue
+            img = vol[src]
+            if p.flip:
+                img = img[:, ::-1]                   # laterality canonicalisation
+            stack[j] = img
+            valid[j] = True
             continue
-        img = vol[src]
-        if p.flip:
-            img = img[:, ::-1]                       # laterality canonicalisation
-        stack[j] = img
+        # 2.5D: the neighbourhood in ANATOMICAL rank, mapped through `order` into the volume.
+        ranks = context_ranks(p.idx, len(order), p.step, ctx)
+        src_c = int(order[ranks[ctx]])
+        if src_c >= len(vol):
+            continue                                 # centre unreadable -> masked out
+        for c, r in enumerate(ranks):
+            s_ = int(order[r])
+            img = vol[s_] if s_ < len(vol) else vol[src_c]
+            if p.flip:
+                img = img[:, ::-1]                   # laterality canonicalisation
+            stack[j, c] = img
         valid[j] = True
     if timers is not None:
         timers["assemble"] = timers.get("assemble", 0.0) + (time.time() - t)
@@ -387,8 +513,10 @@ def build_study_stack_dicom(
     verbose: bool = False,
     timers: Optional[Dict[str, float]] = None,
     phase: float = 0.0,
+    size: int = CACHE_SIZE,
+    context: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str, str]:
-    """One study -> `(stack uint8 [K,384,384], slot_id [K], pos [K], valid [K], side, source)`.
+    """One study -> `(stack uint8 [K,D,D], slot_id [K], pos [K], valid [K], side, source)`.
 
     Steps 1-7 of the module docstring = `decode_study_series` + `assemble_stack`, i.e. exactly
     what this function has always done (`phase=0.0` -> the baseline positions). Kept as the
@@ -396,27 +524,50 @@ def build_study_stack_dicom(
     two halves separately so the decode is paid once.
     """
     sels, vols, anat, side, source = decode_study_series(
-        root, split, study, series_rows, crop_mm=crop_mm, pct=pct, verbose=verbose, timers=timers)
+        root, split, study, series_rows, crop_mm=crop_mm, pct=pct, verbose=verbose,
+        timers=timers, size=size)
     stack, slot_id, pos, valid = assemble_stack(sels, vols, anat, side=side, phase=phase,
-                                                timers=timers)
+                                                timers=timers, size=size, context=context)
     return stack, slot_id, pos, valid, side, source
 
 
-def _stack_to_tensor(stack: np.ndarray, size: int, mean: np.ndarray, std: np.ndarray
-                     ) -> np.ndarray:
-    """uint8 [K,384,384] -> float32 [K,3,size,size], INTER_AREA resize + (x-mean)/std.
+def _stack_to_tensor(stack: np.ndarray, size: int, mean: np.ndarray, std: np.ndarray,
+                     context: int = 0) -> np.ndarray:
+    """uint8 [K,D,D] (or [K,C,D,D]) -> float32 [K,3,size,size], INTER_AREA + (x-mean)/std.
 
     Identical arithmetic to `dataset_hr._read_slice_img` + the dataset's normalisation, which
     is what a member trained at `--size 336` off the 384 cache saw.
+
+    The stack is assembled at the DECODE GROUP's max `slice_context` (`context_for`), so it may
+    carry C = 2*ctx+1 planes while THIS member wants fewer. `context=0` therefore takes the
+    CENTRE plane and replicates it x3 — the original expression, byte for byte, whether the
+    stack came in 3-D or 4-D — and `context=1` uses the three planes as the channels.
     """
     k = stack.shape[0]
+    ctx = int(context)
+    if ctx > 0 and stack.ndim != 4:
+        raise ValueError(f"member wants slice_context={ctx} but the assembled stack has shape "
+                         f"{stack.shape} (no neighbour planes) — the decode group's context "
+                         f"was computed without it")
+    if ctx > 0 and stack.shape[1] != 2 * ctx + 1:
+        raise ValueError(f"member wants slice_context={ctx} ({2 * ctx + 1} channels) but the "
+                         f"stack carries {stack.shape[1]}")
     out = np.empty((k, 3, size, size), dtype=np.float32)
     for j in range(k):
-        img = stack[j]
-        if img.shape != (size, size):
-            img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
-        f = img.astype(np.float32) / 255.0
-        out[j] = (np.stack([f, f, f], axis=0) - mean) / std
+        if ctx <= 0:
+            img = stack[j] if stack.ndim == 3 else stack[j, stack.shape[1] // 2]
+            if img.shape != (size, size):
+                img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+            f = img.astype(np.float32) / 255.0
+            out[j] = (np.stack([f, f, f], axis=0) - mean) / std
+        else:
+            planes = []
+            for c in range(stack.shape[1]):
+                img = stack[j, c]
+                if img.shape != (size, size):
+                    img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
+                planes.append(img.astype(np.float32) / 255.0)
+            out[j] = (np.stack(planes, axis=0) - mean) / std
     return out
 
 
@@ -510,8 +661,9 @@ def predict_studies_v2(
     """Ensemble prediction -> DataFrame `[ID_COL + 12 columns]`, one row per study.
 
     Two input paths, chosen automatically:
-      * a **DICOM mount** (Kaggle, or `/tmp/dicom_mount`): decode once per study, per-series
-        percentile + 140 mm crop through `decode.read_series_v2`, side from the headers;
+      * a **DICOM mount** (Kaggle, or `/tmp/dicom_mount`): decode once per study PER DECODE
+        GROUP `(crop_mm, pct)`, per-series percentile + that group's physical crop through
+        `decode.read_series_v2` at `decode_size_for(group)`, side from the headers;
       * a **cache root** (`data/cache_c140_384`, split `train`): the training dataset itself,
         with `k_scale=1.0` and the side parquet — the OOF-style evaluation path.
 
@@ -544,7 +696,11 @@ def predict_studies_v2(
     groups: Dict[Tuple, List[int]] = {}
     for i, m in enumerate(members):
         groups.setdefault(m.signature, []).append(i)
-    print(f"[predict] {len(members)} v2 member(s) in {len(groups)} size group(s): "
+    dgroups = decode_groups_v2(members)
+    print(f"[predict] {len(members)} v2 member(s) in {len(dgroups)} decode group(s): "
+          f"{[(key[0], decode_size_for(members, ix), len(ix)) for key, ix in dgroups.items()]} "
+          f"(crop_mm, decode_size, n_members)")
+    print(f"[predict] {len(groups)} size group(s): "
           f"{[(sig[0], len(ix)) for sig, ix in groups.items()]} (size, n)")
     if len(phases) > 1:
         print(f"[tta] v2: S={len(phases)} slot phase(s), {tta_combine}-averaged across variants")
@@ -562,75 +718,112 @@ def predict_studies_v2(
 
 
 def _predict_dicom(members, root, split, groups, batch, device, study_ids, mode, w,
-                   verbose_decode, phases=(0.0,)) -> Dict[int, pd.DataFrame]:
+                   verbose_decode, phases=(0.0,), decode_size_override=None
+                   ) -> Dict[int, pd.DataFrame]:
     series_csv = os.path.join(root, f"{split}_series.csv")
     series_rows = group_series_rows(pd.read_csv(series_csv))
     base = os.path.join(root, f"{split}_series")
     have = set(os.listdir(base)) if os.path.isdir(base) else set()
     ids = [str(s) for s in (study_ids if study_ids is not None else sorted(series_rows))
            if str(s) in have]
-    m0 = members[0]
-    if any((m.crop_mm, m.pct) != (m0.crop_mm, m0.pct) for m in members):
-        print(f"[predict] WARNING members disagree on (crop_mm, pct); decoding with "
-              f"{m0.name}'s ({m0.crop_mm}, {m0.pct}) for all of them")
-    print(f"[predict] DICOM path: {len(ids)} studies from {root} "
-          f"(crop_mm={m0.crop_mm} pct={m0.pct} K={K_FULL})")
 
-    # Buffers are keyed by (variant, decode-group). They hold the uint8 [K,384,384] stacks,
-    # NOT the normalised float tensors: at S=3 x batch 2 that is ~56 MB instead of ~680 MB,
-    # and `_stack_to_tensor` is a pure function of the stack, so moving the call into flush()
-    # changes no number (the S=1 output stays byte-identical).
+    # --- decode groups ------------------------------------------------------------------
+    # One decode per (crop_mm, pct) per study, at that group's `decode_size`; inside a group
+    # the old (size, mean, std) signature split still decides how many normalised tensors are
+    # built. `groups` (the caller's signature map) is re-derived per decode group so that with
+    # ONE decode group the iteration order — and therefore every number — is unchanged.
+    specs: List[Dict] = []
+    for key, idxs in decode_groups_v2(members).items():
+        dsize = int(decode_size_override) if decode_size_override else decode_size_for(members, idxs)
+        sub: Dict[Tuple, List[int]] = {}
+        for i in idxs:
+            sub.setdefault(members[i].signature, []).append(i)
+        specs.append({"crop_mm": key[0], "pct": key[1], "size": dsize, "sub": sub,
+                      "n": len(idxs), "tag": f"c{key[0]:g}@{dsize}",
+                      "context": context_for(members, idxs)})
+    G = len(specs)
+    print(f"[predict] DICOM path: {len(ids)} studies from {root} (K={K_FULL}); "
+          f"decode groups: {[(s['crop_mm'], s['size'], s['n']) for s in specs]} "
+          f"(crop_mm, decode_size, n_members)")
+    for s in specs:
+        print(f"   decode group {s['tag']}: crop_mm={s['crop_mm']} pct={s['pct']} "
+              f"decode_size={s['size']} slice_context={s['context']} "
+              f"members={[members[i].name for ix in s['sub'].values() for i in ix]}")
+
+    # Buffers are keyed by (variant, decode group). They hold the uint8 [K,D,D] stacks, NOT the
+    # normalised float tensors: at S=3 x batch 2 x one 384 group that is ~56 MB instead of
+    # ~680 MB, and `_stack_to_tensor` is a pure function of the stack, so keeping the call in
+    # flush() changes no number (the S=1, one-group output stays byte-identical). A second
+    # decode group adds one more uint8 stack per (variant, study-in-batch) — another 57 MB at
+    # 384, 101 MB at 512, for S=3 x batch 2 — and is freed by the same flush().
     S = len(phases)
     timers: Dict[str, float] = {}
     per_member: Dict[Tuple[int, int], List[np.ndarray]] = {(v, i): []
                                                            for v in range(S)
                                                            for i in range(len(members))}
     order_ids: List[str] = []
-    buf: Dict[int, List[np.ndarray]] = {v: [] for v in range(S)}
-    buf_meta: Dict[int, List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {v: [] for v in range(S)}
+    buf: Dict[Tuple[int, int], List[np.ndarray]] = {(v, g): []
+                                                    for v in range(S) for g in range(G)}
+    buf_meta: Dict[Tuple[int, int], List[Tuple[np.ndarray, np.ndarray, np.ndarray]]] = {
+        (v, g): [] for v in range(S) for g in range(G)}
 
     def flush():
-        if not buf_meta[0]:
+        if not buf_meta[(0, 0)]:
             return
         t = time.time()
         for v in range(S):
-            sid = torch.from_numpy(np.stack([b[0] for b in buf_meta[v]])).to(device)
-            pos = torch.from_numpy(np.stack([b[1] for b in buf_meta[v]])).to(device)
-            val = torch.from_numpy(np.stack([b[2] for b in buf_meta[v]])).to(device)
-            for sig, idxs in groups.items():
-                mm = members[idxs[0]]
-                x = torch.from_numpy(np.stack([_stack_to_tensor(s, mm.size, mm.mean, mm.std)
-                                               for s in buf[v]])).to(device, non_blocking=True)
-                for i in idxs:
-                    logits = _forward_with_guard(members[i].model, x, device,
-                                                 slot_id=sid, pos=pos, valid=val)
-                    per_member[(v, i)].append(torch.sigmoid(logits.float()).cpu().numpy())
-                del x
-            buf[v].clear()
-            buf_meta[v].clear()
+            for g, spec in enumerate(specs):
+                meta = buf_meta[(v, g)]
+                sid = torch.from_numpy(np.stack([b[0] for b in meta])).to(device)
+                pos = torch.from_numpy(np.stack([b[1] for b in meta])).to(device)
+                val = torch.from_numpy(np.stack([b[2] for b in meta])).to(device)
+                for sig, idxs in spec["sub"].items():
+                    mm = members[idxs[0]]
+                    x = torch.from_numpy(
+                        np.stack([_stack_to_tensor(s, mm.size, mm.mean, mm.std,
+                                                   mm.slice_context)
+                                  for s in buf[(v, g)]])).to(device, non_blocking=True)
+                    for i in idxs:
+                        logits = _forward_with_guard(members[i].model, x, device,
+                                                     slot_id=sid, pos=pos, valid=val)
+                        per_member[(v, i)].append(torch.sigmoid(logits.float()).cpu().numpy())
+                    del x
+                buf[(v, g)].clear()
+                buf_meta[(v, g)].clear()
         timers["forward"] = timers.get("forward", 0.0) + (time.time() - t)
 
     for n, study in enumerate(ids):
-        # ONE decode per study, shared by every variant (and by every size group).
-        sels, vols, anat, side, source = decode_study_series(
-            root, split, study, series_rows, crop_mm=m0.crop_mm, pct=m0.pct,
-            verbose=verbose_decode, timers=timers)
-        n_valid = 0
-        for v, ph in enumerate(phases):
-            stack, slot_id, pos, valid = assemble_stack(sels, vols, anat, side=side, phase=ph,
-                                                        timers=timers)
-            buf[v].append(stack)
-            buf_meta[v].append((slot_id, pos, valid))
-            n_valid = int(valid.sum()) if v == 0 else n_valid
-        del vols, anat
+        # ONE decode per (crop_mm, pct) per study, shared by every variant and every size group
+        # inside it. `plan_cache` keeps the slot plan and the DICOM-header slice order across
+        # the groups of THIS study, so a second crop costs pixels only.
+        plan_cache: Dict = {}
+        n_valid, side, source = 0, CANONICAL_SIDE, "no-meta"
+        for g, spec in enumerate(specs):
+            sels, vols, anat, side, source = decode_study_series(
+                root, split, study, series_rows, crop_mm=spec["crop_mm"], pct=spec["pct"],
+                verbose=verbose_decode, timers=timers, size=spec["size"],
+                timer_tag=(spec["tag"] if G > 1 else None),
+                plan_cache=(plan_cache if G > 1 else None))
+            for v, ph in enumerate(phases):
+                stack, slot_id, pos, valid = assemble_stack(sels, vols, anat, side=side,
+                                                            phase=ph, timers=timers,
+                                                            size=spec["size"],
+                                                            context=spec["context"])
+                buf[(v, g)].append(stack)
+                buf_meta[(v, g)].append((slot_id, pos, valid))
+                if g == 0 and v == 0:
+                    n_valid = int(valid.sum())
+            del vols, anat
         print(f"  [study {n + 1}/{len(ids)}] {study[-12:]} side={side} ({source}) "
-              f"valid={n_valid}/{K_FULL}" + (f" x{S} variants" if S > 1 else ""), flush=True)
+              f"valid={n_valid}/{K_FULL}" + (f" x{S} variants" if S > 1 else "")
+              + (f" x{G} decode groups" if G > 1 else ""), flush=True)
         order_ids.append(str(study))
-        if len(buf_meta[0]) >= max(1, int(batch)):
+        if len(buf_meta[(0, 0)]) >= max(1, int(batch)):
             flush()
     flush()
     print(" ", fallback_report()
-          + (f"  [padded counts each of the {S} variants separately]" if S > 1 else ""))
+          + (f"  [padded counts each of the {S} variant(s) x {G} decode group(s) separately]"
+             if S * G > 1 else ""))
     for k_, v_ in sorted(timers.items()):
         print(f"[time] stage=v2_{k_} elapsed={v_:.1f}s", flush=True)
 
@@ -654,6 +847,26 @@ def _predict_cache(members, root, split, groups, batch, workers, device, study_i
                                                    split=split)
         index = build_index_v2(root, split=split, order=resolver)
     side_map = load_side_map(side_parquet)
+    # Consistency with the DICOM path: a cache root IS one (crop_mm, size) rendering, so more
+    # than one decode group cannot be served here, and a member whose recorded crop disagrees
+    # with the root it is being scored on is the exact bug the DICOM grouping now prevents.
+    dgroups = decode_groups_v2(members)
+    print(f"[predict] cache path: {len(members)} v2 member(s) in {len(dgroups)} decode "
+          f"group(s): {[(k[0], decode_size_for(members, ix), len(ix)) for k, ix in dgroups.items()]} "
+          f"(crop_mm, decode_size, n_members)")
+    root_crop, root_size = parse_cache_contract(root)
+    if root_crop is not None:
+        if len(dgroups) > 1:
+            print(f"[predict] WARNING cache root {os.path.basename(root)} renders ONE crop "
+                  f"({root_crop} mm); members span {sorted(k[0] for k in dgroups)} — every "
+                  f"member is being scored on {root_crop} mm regardless of its metadata")
+        for m in members:
+            if abs(float(m.crop_mm) - float(root_crop)) > 1e-6:
+                print(f"[predict] WARNING {m.name}: crop_mm={m.crop_mm} but cache root is "
+                      f"{root_crop} mm — scoring it on an input contract it was not trained on")
+            if root_size is not None and int(m.size) > int(root_size):
+                print(f"[predict] WARNING {m.name}: size={m.size} > cache edge {root_size} "
+                      f"— the bag will be UP-sampled")
     ids = list(index.keys()) if study_ids is None else \
         [str(s) for s in study_ids if str(s) in index]
     out: Dict[int, pd.DataFrame] = {}
@@ -667,10 +880,12 @@ def _predict_cache(members, root, split, groups, batch, workers, device, study_i
             ds = StudyBagDatasetV2(ids, index, labels=None, size=m0.size, train=False,
                                    mean=np.asarray(m0.mean).ravel(),
                                    std=np.asarray(m0.std).ravel(),
-                                   k_scale=1.0, side_map=side_map, phase=ph)
+                                   k_scale=1.0, side_map=side_map, phase=ph,
+                                   slice_context=m0.slice_context)
             loader = DataLoader(ds, batch_size=max(1, int(batch)), shuffle=False,
                                 num_workers=workers, pin_memory=str(device).startswith("cuda"))
-            print(f"[predict] cache path: group size={m0.size}, {len(ds)} studies from {root}"
+            print(f"[predict] cache path: group size={m0.size} "
+                  f"slice_context={m0.slice_context}, {len(ds)} studies from {root}"
                   + (f" [{variant_label(_lbl_idx(v, ph), ph)}]" if len(phases) > 1 else ""))
             got: List[str] = []
             chunks: Dict[int, List[np.ndarray]] = {i: [] for i in idxs}
@@ -821,4 +1036,5 @@ __all__ = [
     "MemberV2", "load_members_v2", "predict_studies_v2", "run_submission_v2", "is_v2_meta",
     "check_fingerprint_v2", "compute_fingerprint_v2", "build_study_stack_dicom",
     "decode_study_series", "assemble_stack", "has_read_series_v2", "MODE_TAG_V2", "CACHE_SIZE",
+    "decode_groups_v2", "decode_size_for", "context_for", "parse_cache_contract",
 ]

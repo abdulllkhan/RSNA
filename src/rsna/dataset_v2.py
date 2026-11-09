@@ -55,9 +55,19 @@ over `(plane, fluid, n_slices)` records; `infer_v2.py` calls the SAME two functi
 DICOM mount, so the slot choice, the positions and the canonicalisation cannot drift between
 train and test. Only the materialisation differs (JPEG path vs decoded volume).
 
+2.5D SLOT CONTEXT (`slice_context=N`, reports/ctx25d_v1.md). With N=0 (the default) the
+grayscale slice is replicated across the 3 backbone channels, as it always was. With N=1 the
+three channels become [previous, this, next] of the SAME series in ANATOMICAL order, clamped
+at the series ends — through-plane context for the meniscal/ligament tears, at zero extra
+decode. `context_ranks` is the one definition of "which neighbours", shared by this module and
+`infer_v2.assemble_stack`, and it walks `SlotPick.step`, which is -1 for a left knee's
+sagittal slots (whose emitted order is reversed by the canonicalisation) and +1 everywhere
+else — so "previous/next" is a canonical direction, not a file-order one.
+
 TENSOR CONTRACT
 ---------------
-    x        float32 [K, 3, S, S]   grayscale replicated x3, (x - mean) / std
+    x        float32 [K, 3, S, S]   grayscale replicated x3 (or [prev,cur,next] at
+                                    slice_context=1), (x - mean) / std
     slot_id  int64   [K]            0..4, index into SLOTS
     pos      float32 [K]            within-slot normalised position (j+0.5)/n, canonicalised
     valid    bool    [K]            0 only where the study has no series for that plane
@@ -114,6 +124,23 @@ V2_JITTER = 1.0                       # train-time +/- 0.5 slot spacing
 V2_CROP_MM = 140.0                    # recorded in the ckpt; applied by the cache/decoder
 V2_PCT = (1.0, 99.0)                  # per-series percentile normalisation, ditto
 CANONICAL_SIDE = "R"                         # canonical knee
+
+
+def parse_cache_contract(cache_root) -> Tuple[Optional[float], Optional[int]]:
+    """`data/cache_c110_384` -> `(110.0, 384)`; a name that does not match -> `(None, None)`.
+
+    A pre-decoded cache directory carries NO header: its name is the only in-band record of
+    the physical crop and the pixel edge its JPEGs were written with. `train_v2` stamps the
+    parsed crop into the checkpoint (so `MemberV2.crop_mm` cannot drift from the pixels the
+    model actually saw) and `infer_v2._predict_cache` uses it to catch a member being scored
+    on a rendering it was not trained on.
+    """
+    import re
+
+    m = re.search(r"cache_c(\d+)_(\d+)",
+                  os.path.basename(os.path.normpath(str(cache_root))))
+    return (float(m.group(1)), int(m.group(2))) if m else (None, None)
+
 
 # Per-process counters for the two documented degradations. Not fatal, never silent.
 FALLBACKS: Dict[str, int] = {"fluid_swap": 0, "missing_plane": 0, "padded": 0}
@@ -359,6 +386,34 @@ class SlotPick(NamedTuple):
     pos: float        # within-slot normalised position in [0,1], AFTER canonicalisation
     flip: bool        # horizontal flip (left knee, Coronal/Axial)
     valid: bool
+    step: int = 1     # +1/-1: which way "the next slice" runs in the series' anatomical order
+                      # AFTER canonicalisation (-1 for a left knee's Sagittal slots, whose
+                      # emitted order `plan_slots` reverses). Only `context_ranks` reads it, so
+                      # a slice_context=0 bag is unaffected by its value.
+
+
+def context_ranks(idx: int, n_slices: int, step: int = 1, context: int = 0) -> List[int]:
+    """Anatomical ranks of the `[prev, this, next]` neighbourhood of `idx` — ONE definition.
+
+    `context=0` -> `[idx]` (today's single slice). `context=N` -> `2N+1` ranks, offset by
+    `d * step` for `d` in `-N..+N` and CLAMPED at both ends of the series, so the first and
+    last slices repeat themselves rather than wrapping or dropping out (a 2-slice series at
+    N=1 yields [0,0,1] / [0,1,1]).
+
+    `step` comes from `SlotPick.step`: +1 normally, **-1 for a left knee's Sagittal slots**,
+    because `plan_slots` reverses their emitted order to canonicalise the knee — so walking
+    +1 in the file/rank order would walk the WRONG way through the anatomy. This is the single
+    function both materialisations call (`StudyBagDatasetV2.__getitem__` on the JPEG cache,
+    `infer_v2.assemble_stack` on the decoded DICOM volume), which is what makes the two paths
+    pick the same neighbours by construction.
+    """
+    n = int(n_slices)
+    base = min(max(0, int(idx)), max(0, n - 1))
+    c = int(context)
+    if c <= 0:
+        return [base]
+    st = 1 if int(step) >= 0 else -1
+    return [min(n - 1, max(0, base + d * st)) for d in range(-c, c + 1)]
 
 
 def select_slot_series(
@@ -542,12 +597,16 @@ def plan_slots(
                 for f in _slot_fracs(sel.n_want, train, rng, jitter, phase)]
         if n < sel.n_want:
             FALLBACKS["padded"] += 1
-        if rev_sag and sel.plane == "Sagittal":
+        rev = bool(rev_sag and sel.plane == "Sagittal")
+        if rev:
             idxs = idxs[::-1]
         flip = sel.plane in flip_planes
+        # `step` is the through-plane direction AFTER canonicalisation: the reversal above makes
+        # bag position j+1 an anatomically SMALLER rank, so "the next slice" is rank-1 there.
+        step = -1 if rev else 1
         for j, ix in enumerate(idxs):
             picks.append(SlotPick(sel.slot, sel.rec.series, int(ix),
-                                  (j + 0.5) / max(1, sel.n_want), flip, True))
+                                  (j + 0.5) / max(1, sel.n_want), flip, True, step))
     return picks
 
 
@@ -696,6 +755,7 @@ class StudyBagDatasetV2(Dataset):
         jitter: float = V2_JITTER,
         augment: bool = True,
         phase: float = 0.0,
+        slice_context: int = 0,
     ):
         self.study_ids = [str(s) for s in study_ids if str(s) in index]
         self.index = index
@@ -714,6 +774,13 @@ class StudyBagDatasetV2(Dataset):
         if self.train and self.phase:
             raise ValueError("phase != 0 is an EVAL-only TTA knob (train jitter already "
                              "resamples the grid); got train=True")
+        # 2.5D slot context: 0 = replicate the slice across the 3 channels (the original
+        # contract, byte for byte); 1 = [prev, this, next]. Only 0/1 are representable, because
+        # the backbone's stem is 3-channel.
+        self.slice_context = int(slice_context)
+        if self.slice_context not in (0, 1):
+            raise ValueError(f"slice_context must be 0 or 1 (the backbone stem takes 3 "
+                             f"channels); got {slice_context!r}")
         self.side_map = dict(side_map or {})
         self._slot_id = slot_id_vector(self.k_scale)
 
@@ -771,14 +838,39 @@ class StudyBagDatasetV2(Dataset):
             rec = by_uid.get(p.series)
             if rec is None or not rec.paths:
                 continue
-            img = read_slice_hr(rec.paths[min(p.idx, len(rec.paths) - 1)], size)
-            if img is None:                                # unreadable slice -> masked out
-                continue
-            if p.flip:
-                img = np.ascontiguousarray(img[:, ::-1])   # laterality canonicalisation
-            if self.train and self.augment:
-                img = StudyBagDataset._augment(self, img, rng)   # affine+intensity, NO flips
-            chw = np.stack([img, img, img], axis=0)
+            if self.slice_context <= 0:
+                img = read_slice_hr(rec.paths[min(p.idx, len(rec.paths) - 1)], size)
+                if img is None:                            # unreadable slice -> masked out
+                    continue
+                if p.flip:
+                    img = np.ascontiguousarray(img[:, ::-1])  # laterality canonicalisation
+                if self.train and self.augment:
+                    img = StudyBagDataset._augment(self, img, rng)  # affine+intensity, NO flips
+                chw = np.stack([img, img, img], axis=0)
+            else:
+                # 2.5D: [prev, this, next] in ANATOMICAL order (`rec.paths` is already ordered),
+                # walking `p.step` so a left knee's reversed sagittal stack runs the same way.
+                ranks = context_ranks(p.idx, len(rec.paths), p.step, self.slice_context)
+                ctr = int(self.slice_context)
+                planes = [read_slice_hr(rec.paths[r], size) for r in ranks]
+                if planes[ctr] is None:                    # the CENTRE slice is the bag position
+                    continue
+                planes = [planes[ctr] if q is None else q for q in planes]  # bad neighbour -> centre
+                if p.flip:
+                    planes = [np.ascontiguousarray(q[:, ::-1]) for q in planes]
+                if self.train and self.augment:
+                    # ONE geometric+intensity transform for the whole neighbourhood: rewind the
+                    # generator before each channel so all three get identical parameters (three
+                    # independent warps would shear the through-plane signal apart). The rng ends
+                    # where a single `_augment` call would have left it, so the draw ORDER — and
+                    # therefore every slice_context=0 bag — is unchanged.
+                    st = rng.bit_generator.state
+                    aug = []
+                    for q in planes:
+                        rng.bit_generator.state = st
+                        aug.append(StudyBagDataset._augment(self, q, rng))
+                    planes = aug
+                chw = np.stack(planes, axis=0)
             bag[j] = (chw - self.mean) / self.std
             valid[j] = True
 
@@ -796,6 +888,7 @@ __all__ = [
     "SeriesRecV2", "SlotSel", "SlotPick", "StudyBagDatasetV2",
     "build_index_v2", "default_index_cache_v2", "load_labels_v2", "load_side_map",
     "canonical_ops_for", "select_slot_series", "plan_slots", "plan_study", "slot_instance_uids_v2",
+    "context_ranks",
     "V2_PHASE_LADDER", "variant_phases", "variant_label", "variant_index_of",
     "scaled_slot_counts", "slot_total", "slot_id_vector", "fallback_report", "FALLBACKS",
     "W_COLS", "IMAGENET_MEAN", "IMAGENET_STD",

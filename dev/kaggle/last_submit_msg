@@ -1,1 +1,0 @@
-multi-arm rank-avg base=1,hr=3 on the runtime-fixed kernel (fp16 T4, shallow weights) — fast twin of sub #4

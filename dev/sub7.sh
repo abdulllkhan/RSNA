@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Submission #7+: 5x224 base + 5x384 hr + v2 members (V2_CKPTS="models/v2_x_fold0.pt ...") with BAKED weights + RSNA_TTA=S.
 # Usage: V2_CKPTS="models/v2_effv2s384_fold0.pt" dev/sub7.sh "base=1,hr=3,v2=4" 3   (dataset re-versioned by default: REVERSION=1)
+# Optional (all default off): BUNDLE_PKG=<dir> inlines the notebook modules from <dir> (dev/sub13/export_head_pkg.py);
+#   READER_N=<n> requires exactly n '[member] reader' lines in the kernel log; EXPECT_LOG_RE may hold several
+#   newline-separated regexes, EVERY one must match (a single-line value behaves as before).
 set -uo pipefail
 cd /home/abdulllkhan/Documents/RSNA || exit 1
 export KAGGLE_CONFIG_DIR="$HOME/.kaggle"; KG="../multi_step_tool_attack/.venv/bin/kaggle"
@@ -20,9 +23,11 @@ nv2=0; for cp in $V2_CKPTS; do [ -f "$cp" ] || fail "missing v2 ckpt $cp"
   cp "${cp%.pt}.slim.pt" "$PKG/$(basename "$cp")"; rm -f "${cp%.pt}.slim.pt"; nv2=$((nv2+1)); done; log "staged $nv2 v2 member(s): $V2_CKPTS"
 if [ -f "$PLANE0" ]; then if [ "$(stat -c %s "$PLANE0")" -gt 120000000 ]; then PYTHONPATH=$PWD .venv/bin/python dev/slim_ckpt.py "$PLANE0" | grep -E verify || fail "slim plane0"; mv "$PLANE0" models/full/effv2s_plane_k8x3_384_fold0_full.pt; mv "${PLANE0%.pt}.slim.pt" "$PLANE0"; fi; cp "$PLANE0" "$PKG"/; fi
 sed "s/__KAGGLE_USERNAME__/$U/" dev/kaggle/dataset-metadata.json > "$PKG/dataset-metadata.json"; ls "$PKG" | wc -l
+STAMP="${STAMP_OVERRIDE:-PKG_STAMP_$(date +%s).txt}"; echo "$STAMP" > "$PKG/$STAMP"   # proves the NEW dataset version is the one listed (2026-09-20 race: old version served)
 if [ "${REVERSION:-1}" = "1" ]; then $KG datasets version -p "$PKG" -m "multi-arm weights package" --dir-mode zip 2>&1 | tail -2; else log "dataset re-version skipped (REVERSION=0)"; fi
-want=$(ls "$PKG"/*.pt | wc -l); for i in $(seq 1 60); do have=$($KG datasets files "$U/$DS" 2>/dev/null | grep -c '\.pt' || true); [ "$have" -ge "$want" ] && { log "dataset ready $have/$want"; break; }; sleep 15; done
-.venv/bin/python notebook/build_notebook_multi.py 2>&1 | tail -1
+want=$(ls "$PKG"/*.pt | wc -l); ok=0; for i in $(seq 1 80); do lst=$($KG datasets files "$U/$DS" --page-size 200 2>/dev/null); have=$(echo "$lst" | grep -c '\.pt' || true); stt=$($KG datasets status "$U/$DS" 2>/dev/null | tr -d '[:space:]'); if echo "$lst" | grep -q "$STAMP" && [ "$have" -ge "$want" ] && [ "$stt" = "ready" ]; then log "dataset ready $have/$want, stamp $STAMP listed, status ready"; ok=1; break; fi; sleep 15; done; [ "$ok" -eq 1 ] || fail "dataset not ready with stamp $STAMP (have=$have status=$stt)"; log "grace 180 s for version propagation"; sleep 180
+if [ -n "${BUNDLE_PKG:-}" ]; then [ -d "$BUNDLE_PKG" ] || fail "BUNDLE_PKG=$BUNDLE_PKG is not a directory"; log "bundle modules from BUNDLE_PKG=$BUNDLE_PKG"; fi
+RSNA_BUNDLE_PKG="${BUNDLE_PKG:-}" .venv/bin/python notebook/build_notebook_multi.py 2>&1 | tail -1
 # bake arm weights (Kaggle has no env): default the env lookup to $W in both generated files
 sed -i "s|os.environ.get(\"RSNA_ARM_WEIGHTS\")|os.environ.get(\"RSNA_ARM_WEIGHTS\", \"$W\")|" notebook/submission_multi_standalone.py
 sed -i "s|os.environ.get(\\\\\"RSNA_ARM_WEIGHTS\\\\\")|os.environ.get(\\\\\"RSNA_ARM_WEIGHTS\\\\\", \\\\\"$W\\\\\")|" notebook/submission_multi.ipynb
@@ -40,5 +45,7 @@ rm -rf /tmp/koutm; mkdir -p /tmp/koutm; $KG kernels output "$U/$K" -p /tmp/koutm
 nd=$(cut -d, -f2- /tmp/koutm/submission.csv | tail -n +2 | sort -u | wc -l); pl=$(grep -ac "arm=hr" /tmp/koutm/*.log 2>/dev/null || echo 0); tt=$(grep -ac "\[tta\] arm=" /tmp/koutm/*.log 2>/dev/null || echo 0)
 v2n=$(grep -aoE "\[predict\] [0-9]+ v2 member" /tmp/koutm/*.log 2>/dev/null | grep -oE '[0-9]+' | head -1); v2n=${v2n:-0}; cb=$(grep -ac "\[combine\].*'v2'" /tmp/koutm/*.log 2>/dev/null || echo 0)
 log "distinct rows=$nd hr members detected=$pl tta lines=$tt v2 members=$v2n/$nv2 combine-with-v2=$cb weights=$W S=$S"; [ "$nd" -gt 1 ] && [ "$pl" -ge 5 ] && [ "$tt" -ge 2 ] && [ "$v2n" -eq "$nv2" ] && [ "$cb" -ge 1 ] || fail "gate nd=$nd hr=$pl tta=$tt v2=$v2n/$nv2 cb=$cb"
+if [ "${READER_N:-0}" -gt 0 ]; then rn=$(cat /tmp/koutm/*.log 2>/dev/null | grep -ac "\[member\] reader " || true); log "reader member lines=$rn (want $READER_N)"; [ "$rn" -eq "$READER_N" ] || fail "reader members $rn != $READER_N -> NOT submitting"; fi
+if [ -n "${EXPECT_LOG_RE:-}" ]; then nre=0; while IFS= read -r re; do [ -n "$re" ] || continue; nre=$((nre+1)); grep -aqE "$re" /tmp/koutm/*.log || fail "kernel log does not match EXPECT_LOG_RE=$re (wrong dataset version / plumbing) -> NOT submitting"; done <<< "$EXPECT_LOG_RE"; log "kernel log matches EXPECT_LOG_RE ($nre pattern(s), all required)"; fi
 $KG competitions submit "$COMP" -k "$U/$K" -v "$ver" -f submission.csv -m "sub7: rank-avg $W, TTA S=$S on base/hr; base=5 hr=5 v2=$nv2 [$(echo $V2_CKPTS | xargs -n1 basename | tr '\n' ' ')] (multi v$ver)" 2>&1 | tail -3
 $KG competitions submissions "$COMP" 2>&1 | sed -n '3p'; log "SUB7 DONE"

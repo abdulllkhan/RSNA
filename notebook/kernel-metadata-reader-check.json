@@ -1,0 +1,17 @@
+{
+  "id": "abdullllkhan/rsna-knee-reader-check",
+  "title": "RSNA Knee Reader Check",
+  "code_file": "reader_check.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "dataset_sources": [
+    "goodpjw2008/rsna-knee-2-5d-convnext-reader"
+  ],
+  "kernel_sources": []
+}
